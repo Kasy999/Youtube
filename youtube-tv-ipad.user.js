@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube TV iPad - Werbefrei und Vollbild
 // @namespace    yt-tv-ipad
-// @version      1.6.0
+// @version      1.7.1
 // @description  Entfernt Werbung in der YouTube-TV-Oberflaeche, SponsorBlock, Touch-Steuerung und Vollbild fuer das iPad.
 // @match        *://*.youtube.com/*
 // @match        *://youtube.com/*
