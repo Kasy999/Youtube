@@ -1,18 +1,22 @@
 // ==UserScript==
 // @name         YouTube TV iPad - Werbefrei und Vollbild
 // @namespace    yt-tv-ipad
-// @version      1.3.1
+// @version      1.4.0
 // @description  Entfernt Werbung in der YouTube-TV-Oberflaeche, SponsorBlock, Touch-Steuerung und Vollbild fuer das iPad.
-// @match        https://www.youtube.com/tv*
-// @match        https://youtube.com/tv*
-// @match        https://m.youtube.com/tv*
+// @match        *://*.youtube.com/*
+// @match        *://youtube.com/*
 // @run-at       document-start
 // @grant        none
-// @inject-into  page
+// @sandbox      JavaScript
+// @updateURL    https://raw.githubusercontent.com/Kasy999/Youtube/main/youtube-tv-ipad.user.js
+// @downloadURL  https://raw.githubusercontent.com/Kasy999/Youtube/main/youtube-tv-ipad.user.js
 // ==/UserScript==
 
 (function () {
   'use strict';
+
+  // Nur in der TV-Oberflaeche (youtube.com/tv) aktiv werden
+  if (!/^\/tv(\/|$)/.test(location.pathname)) return;
 
   // ------------------------------------------------------------
   // EINSTELLUNGEN – hier kannst du Funktionen an- und ausschalten
@@ -29,12 +33,12 @@
       // 'preview',     // Vorschau/Rückblick
       // 'music_offtopic', // Nicht-Musik-Teile in Musikvideos
     ],
-    autoFullscreen: true,          // beim Tippen automatisch ins Vollbild
-    fullscreenButton: true,        // kleiner Vollbild-Knopf oben rechts
+    fullscreen: true,              // Seite beim Tippen ins Vollbild schalten
     touchNav: true,                // Wischen = Pfeiltasten wie auf der Fernbedienung
     swipeStepPx: 110,              // so viele Pixel Wischen = ein Schritt
-    backButton: true,              // Zurück-Knopf oben links
     tapAsEnter: false,             // true, falls Antippen nichts auswählt
+    longPressMs: 600,              // so lange drücken, bis die Knöpfe erscheinen
+    hideAfterMs: 2000,             // Knöpfe verschwinden nach dieser Zeit wieder
   };
 
   // ------------------------------------------------------------
@@ -149,14 +153,44 @@
 
   // ------------------------------------------------------------
   // 3) VOLLBILD
-  // iPadOS erlaubt Vollbild nur nach einer Berührung.
-  // Deshalb: beim Tippen automatisch ins Vollbild, plus Knopf
-  // oben rechts zum Ein-/Ausschalten.
+  // a) Die Seite füllt immer den ganzen sichtbaren Bereich aus
+  //    (auch unter Notch/abgerundeten Ecken, ohne Ränder).
+  // b) Beim Tippen wird echtes Vollbild angefordert. iPadOS
+  //    erlaubt das nur nach einer Berührung – und nur, wenn der
+  //    Browser es zulässt. Geht es nicht, schickt der Knopf ⛶
+  //    das laufende Video in den nativen iPad-Player.
   // ------------------------------------------------------------
-  let autoFs = CONFIG.autoFullscreen;
+  function applyFillStyles() {
+    if (document.getElementById('yttv-fill-style')) return;
+    const css = [
+      'html, body {',
+      '  margin:0 !important; padding:0 !important;',
+      '  width:100% !important; height:100% !important;',
+      '  min-height:100dvh !important;',
+      '  overflow:hidden !important; background:#000 !important;',
+      '  overscroll-behavior:none !important;',
+      '  -webkit-touch-callout:none !important;', // kein Popup bei langem Drücken
+      '  -webkit-user-select:none !important; user-select:none !important;',
+      '  -webkit-tap-highlight-color:transparent !important;',
+      '}',
+    ].join('\n');
+    const style = document.createElement('style');
+    style.id = 'yttv-fill-style';
+    style.textContent = css;
+    (document.head || document.documentElement).appendChild(style);
 
-  // Kann der Browser die ganze Seite ins Vollbild schalten?
-  // (Orion/WKWebView erlaubt das oft nicht.)
+    // Viewport so setzen, dass auch die Randbereiche genutzt werden
+    let vp = document.querySelector('meta[name="viewport"]');
+    if (!vp) {
+      vp = document.createElement('meta');
+      vp.name = 'viewport';
+      (document.head || document.documentElement).appendChild(vp);
+    }
+    vp.content = 'width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover';
+  }
+
+  let wantFs = CONFIG.fullscreen;
+
   function pageFsSupported() {
     const el = document.documentElement;
     const hasFn = !!(el.requestFullscreen || el.webkitRequestFullscreen);
@@ -180,7 +214,7 @@
   function enterFs(fromButton) {
     if (!pageFsSupported()) {
       if (fromButton && !videoFs()) {
-        toast('Seiten-Vollbild geht in Orion nicht – starte ein Video und tippe dann auf ⛶');
+        toast('Seiten-Vollbild erlaubt der Browser nicht – starte ein Video und tippe dann auf ⛶', 3500);
       }
       return;
     }
@@ -201,19 +235,8 @@
     } catch (e) { /* ignorieren */ }
   }
 
-  document.addEventListener('touchend', function (ev) {
-    if (ev.target && ev.target.id === 'yttv-fs-btn') return;
-    if (autoFs && !isFs()) enterFs();
-    showButton();
-  }, true);
-
   // ------------------------------------------------------------
-  // 4) TOUCH-STEUERUNG
-  // Die TV-Oberfläche kennt nur Fernbedienungs-Tasten. Wir
-  // übersetzen Wischgesten in Pfeiltasten:
-  //   nach oben wischen   → runter      nach links wischen  → rechts
-  //   nach unten wischen  → hoch        nach rechts wischen → links
-  //   vom linken Rand nach rechts wischen → Zurück
+  // 4) TASTEN DER FERNBEDIENUNG NACHBILDEN
   // ------------------------------------------------------------
   const KEYS = {
     up:    { key: 'ArrowUp',    code: 'ArrowUp',    keyCode: 38 },
@@ -242,68 +265,53 @@
     }
   }
 
-  function isOwnUi(el) {
-    return el && el.closest && el.closest('#yttv-fs-btn, #yttv-back-btn');
-  }
-
-  if (CONFIG.touchNav) {
-    let sx = 0, sy = 0, st = 0, tracking = false;
-
-    document.addEventListener('touchstart', function (ev) {
-      if (ev.touches.length !== 1 || isOwnUi(ev.target)) { tracking = false; return; }
-      const t = ev.touches[0];
-      sx = t.clientX; sy = t.clientY; st = Date.now(); tracking = true;
-    }, { capture: true, passive: true });
-
-    // Normales Scrollen/Zoomen der Seite unterdrücken, sonst wackelt alles
-    document.addEventListener('touchmove', function (ev) {
-      if (tracking) ev.preventDefault();
-    }, { capture: true, passive: false });
-
-    document.addEventListener('touchend', function (ev) {
-      if (!tracking) return;
-      tracking = false;
-      const t = ev.changedTouches[0];
-      const dx = t.clientX - sx;
-      const dy = t.clientY - sy;
-      const adx = Math.abs(dx), ady = Math.abs(dy);
-      const dist = Math.max(adx, ady);
-
-      // Antippen
-      if (dist < 15) {
-        if (CONFIG.tapAsEnter) { ev.preventDefault(); sendKey(KEYS.enter); }
-        return;
-      }
-      if (dist < 40) return;
-
-      ev.preventDefault();
-
-      // Vom linken Rand nach rechts = Zurück
-      if (sx < 30 && dx > 80 && adx > ady) { sendKey(KEYS.back); return; }
-
-      // Schnelles Wischen gibt ein paar Schritte extra
-      const fast = (Date.now() - st) < 200 ? 1.5 : 1;
-      const steps = Math.min(8, Math.max(1, Math.round(dist / CONFIG.swipeStepPx * fast)));
-
-      if (adx > ady) sendKeys(dx < 0 ? KEYS.right : KEYS.left, steps);
-      else sendKeys(dy < 0 ? KEYS.down : KEYS.up, steps);
-    }, { capture: true, passive: false });
-  }
-
   // ------------------------------------------------------------
-  // Kleine Oberfläche: Vollbild-Knopf und Hinweis-Einblendung
+  // 5) KNÖPFE (unsichtbar, erscheinen bei langem Drücken)
   // ------------------------------------------------------------
+  let fsBtn = null;
   let backBtn = null;
-  let btn = null;
-  let hideTimer = null;
   let toastEl = null;
+  let hideTimer = null;
 
-  // Knopf ist immer leicht sichtbar und wird beim Tippen kurz heller
-  function showButton() {
-    if (!btn) return;
-    btn.style.opacity = '0.95';
+  function makeButton(id, label, side) {
+    const b = document.createElement('div');
+    b.id = id;
+    b.textContent = label;
+    b.style.cssText = [
+      'position:fixed', 'top:calc(16px + env(safe-area-inset-top))',
+      side + ':calc(16px + env(safe-area-inset-' + side + '))',
+      'z-index:2147483647',
+      'width:60px', 'height:60px', 'border-radius:30px',
+      'background:rgba(0,0,0,0.75)', 'color:#fff', 'font-size:30px',
+      'border:2px solid rgba(255,255,255,0.7)',
+      'box-shadow:0 4px 16px rgba(0,0,0,0.5)',
+      'display:flex', 'align-items:center', 'justify-content:center',
+      'opacity:0', 'pointer-events:none', 'transition:opacity .25s',
+      '-webkit-user-select:none', 'user-select:none', '-webkit-touch-callout:none',
+    ].join(';');
+    return b;
+  }
+
+  function showControls() {
+    [fsBtn, backBtn].forEach(function (b) {
+      if (!b) return;
+      b.style.opacity = '1';
+      b.style.pointerEvents = 'auto';
+    });
     clearTimeout(hideTimer);
-    hideTimer = setTimeout(function () { btn.style.opacity = '0.5'; }, 3000);
+  }
+
+  function hideControls() {
+    [fsBtn, backBtn].forEach(function (b) {
+      if (!b) return;
+      b.style.opacity = '0';
+      b.style.pointerEvents = 'none';
+    });
+  }
+
+  function scheduleHide() {
+    clearTimeout(hideTimer);
+    hideTimer = setTimeout(hideControls, CONFIG.hideAfterMs);
   }
 
   function toast(text, ms) {
@@ -314,86 +322,163 @@
     toastEl._t = setTimeout(function () { toastEl.style.opacity = '0'; }, ms || 2500);
   }
 
-  let lastPress = 0;
-  function onButton(ev) {
-    ev.preventDefault();
-    ev.stopPropagation();
-    const now = Date.now();
-    if (now - lastPress < 600) return; // touchend + click nicht doppelt zählen
-    lastPress = now;
-    if (isFs()) { autoFs = false; exitFs(); toast('Vollbild aus'); }
-    else { autoFs = true; enterFs(true); }
-    showButton();
+  // Ein Knopf soll bei touchend + click nicht doppelt auslösen
+  function buttonHandler(action) {
+    let last = 0;
+    return function (ev) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      const now = Date.now();
+      if (now - last < 600) return;
+      last = now;
+      action();
+      scheduleHide();
+    };
+  }
+
+  function onFsButton() {
+    if (isFs()) { wantFs = false; exitFs(); toast('Vollbild aus'); }
+    else { wantFs = true; enterFs(true); }
+  }
+
+  function onBackButton() {
+    sendKey(KEYS.back);
   }
 
   function buildUi() {
     const root = document.documentElement;
+    applyFillStyles();
 
-    if (CONFIG.fullscreenButton && !btn) {
-      btn = document.createElement('div');
-      btn.id = 'yttv-fs-btn';
-      btn.textContent = '⛶';
-      btn.style.cssText = [
-        'position:fixed', 'top:16px', 'right:16px', 'z-index:2147483647',
-        'width:52px', 'height:52px', 'border-radius:26px',
-        'background:rgba(0,0,0,0.7)', 'color:#fff', 'font-size:28px',
-        'border:2px solid rgba(255,255,255,0.6)',
-        'display:flex', 'align-items:center', 'justify-content:center',
-        'opacity:0.5', 'transition:opacity .3s', '-webkit-user-select:none',
-        'user-select:none', 'cursor:pointer', 'pointer-events:auto',
-      ].join(';');
-      btn.addEventListener('touchend', onButton, true);
-      btn.addEventListener('click', onButton, true);
+    if (!fsBtn) {
+      fsBtn = makeButton('yttv-fs-btn', '⛶', 'right');
+      const h = buttonHandler(onFsButton);
+      fsBtn.addEventListener('touchend', h, true);
+      fsBtn.addEventListener('click', h, true);
     }
-
-    if (CONFIG.backButton && !backBtn) {
-      backBtn = document.createElement('div');
-      backBtn.id = 'yttv-back-btn';
-      backBtn.textContent = '←';
-      backBtn.style.cssText = [
-        'position:fixed', 'top:16px', 'left:16px', 'z-index:2147483647',
-        'width:52px', 'height:52px', 'border-radius:26px',
-        'background:rgba(0,0,0,0.7)', 'color:#fff', 'font-size:28px',
-        'border:2px solid rgba(255,255,255,0.6)',
-        'display:flex', 'align-items:center', 'justify-content:center',
-        'opacity:0.5', '-webkit-user-select:none', 'user-select:none',
-        'cursor:pointer', 'pointer-events:auto',
-      ].join(';');
-      let lastBack = 0;
-      const onBack = function (ev) {
-        ev.preventDefault();
-        ev.stopPropagation();
-        const now = Date.now();
-        if (now - lastBack < 600) return;
-        lastBack = now;
-        sendKey(KEYS.back);
-      };
-      backBtn.addEventListener('touchend', onBack, true);
-      backBtn.addEventListener('click', onBack, true);
+    if (!backBtn) {
+      backBtn = makeButton('yttv-back-btn', '←', 'left');
+      const h = buttonHandler(onBackButton);
+      backBtn.addEventListener('touchend', h, true);
+      backBtn.addEventListener('click', h, true);
     }
-    if (backBtn && !backBtn.isConnected) root.appendChild(backBtn);
-
     if (!toastEl) {
       toastEl = document.createElement('div');
       toastEl.style.cssText = [
-        'position:fixed', 'bottom:40px', 'left:50%', 'transform:translateX(-50%)',
+        'position:fixed', 'bottom:calc(40px + env(safe-area-inset-bottom))',
+        'left:50%', 'transform:translateX(-50%)',
         'z-index:2147483647', 'padding:10px 18px', 'border-radius:20px',
         'background:rgba(0,0,0,0.8)', 'color:#fff', 'font:16px -apple-system,sans-serif',
         'opacity:0', 'transition:opacity .3s', 'pointer-events:none', 'text-align:center',
+        'max-width:80vw',
       ].join(';');
     }
 
     // Direkt an <html> hängen: Die TV-Oberfläche baut <body> teilweise neu
-    // auf und würde den Knopf sonst wieder entfernen.
-    if (btn && !btn.isConnected) root.appendChild(btn);
-    if (!toastEl.isConnected) root.appendChild(toastEl);
+    // auf und würde die Knöpfe sonst wieder entfernen.
+    [fsBtn, backBtn, toastEl].forEach(function (el) {
+      if (!el.isConnected) root.appendChild(el);
+    });
   }
 
+  // ------------------------------------------------------------
+  // 6) TOUCH-GESTEN
+  //   kurz tippen          → Vollbild anfordern (+ ggf. Auswahl)
+  //   lange drücken        → Knöpfe einblenden (2 s nach Loslassen weg)
+  //   nach oben wischen    → runter     nach links wischen  → rechts
+  //   nach unten wischen   → hoch       nach rechts wischen → links
+  //   vom linken Rand nach rechts wischen → Zurück
+  // ------------------------------------------------------------
+  function isOwnUi(el) {
+    return el && el.closest && el.closest('#yttv-fs-btn, #yttv-back-btn');
+  }
+
+  let sx = 0, sy = 0, st = 0;
+  let tracking = false;
+  let longPressed = false;
+  let lpTimer = null;
+
+  document.addEventListener('touchstart', function (ev) {
+    if (isOwnUi(ev.target)) { tracking = false; return; }
+    if (ev.touches.length !== 1) { tracking = false; clearTimeout(lpTimer); return; }
+    const t = ev.touches[0];
+    sx = t.clientX; sy = t.clientY; st = Date.now();
+    tracking = true;
+    longPressed = false;
+    clearTimeout(lpTimer);
+    lpTimer = setTimeout(function () {
+      longPressed = true;
+      showControls();
+    }, CONFIG.longPressMs);
+  }, { capture: true, passive: true });
+
+  document.addEventListener('touchmove', function (ev) {
+    if (!tracking) return;
+    const t = ev.touches[0];
+    if (Math.abs(t.clientX - sx) > 15 || Math.abs(t.clientY - sy) > 15) {
+      clearTimeout(lpTimer); // Bewegung = kein langes Drücken
+    }
+    // Normales Scrollen/Zoomen unterdrücken, sonst wackelt alles
+    if (CONFIG.touchNav) ev.preventDefault();
+  }, { capture: true, passive: false });
+
+  document.addEventListener('touchend', function (ev) {
+    clearTimeout(lpTimer);
+    if (!tracking) return;
+    tracking = false;
+
+    // Langes Drücken: nur Knöpfe zeigen, sonst nichts auslösen
+    if (longPressed) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      scheduleHide();
+      return;
+    }
+
+    // Jede normale Berührung ist eine Chance, ins Vollbild zu gehen
+    if (wantFs && !isFs()) enterFs(false);
+
+    const t = ev.changedTouches[0];
+    const dx = t.clientX - sx;
+    const dy = t.clientY - sy;
+    const adx = Math.abs(dx), ady = Math.abs(dy);
+    const dist = Math.max(adx, ady);
+
+    // Antippen
+    if (dist < 15) {
+      if (CONFIG.tapAsEnter) { ev.preventDefault(); sendKey(KEYS.enter); }
+      return;
+    }
+    if (!CONFIG.touchNav || dist < 40) return;
+
+    ev.preventDefault();
+
+    // Vom linken Rand nach rechts = Zurück
+    if (sx < 30 && dx > 80 && adx > ady) { sendKey(KEYS.back); return; }
+
+    // Schnelles Wischen gibt ein paar Schritte extra
+    const fast = (Date.now() - st) < 200 ? 1.5 : 1;
+    const steps = Math.min(8, Math.max(1, Math.round(dist / CONFIG.swipeStepPx * fast)));
+
+    if (adx > ady) sendKeys(dx < 0 ? KEYS.right : KEYS.left, steps);
+    else sendKeys(dy < 0 ? KEYS.down : KEYS.up, steps);
+  }, { capture: true, passive: false });
+
+  document.addEventListener('touchcancel', function () {
+    clearTimeout(lpTimer);
+    tracking = false;
+    if (longPressed) scheduleHide();
+  }, { capture: true, passive: true });
+
+  // Kontextmenü/Lupe bei langem Drücken unterdrücken
+  document.addEventListener('contextmenu', function (ev) { ev.preventDefault(); }, true);
+
+  // ------------------------------------------------------------
+  // START
+  // ------------------------------------------------------------
   function start() {
     buildUi();
-    showButton();
-    toast('✓ TV-Skript aktiv', 3500);
-    // Falls die Seite den Knopf entfernt: jede Sekunde wieder einfügen
+    toast('✓ TV-Skript aktiv – lange drücken für Knöpfe', 3500);
+    // Falls die Seite unsere Elemente entfernt: jede Sekunde wieder einfügen
     setInterval(buildUi, 1000);
   }
 
