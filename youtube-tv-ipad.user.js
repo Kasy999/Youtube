@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube TV iPad - Werbefrei und Vollbild
 // @namespace    yt-tv-ipad
-// @version      1.6.0
+// @version      1.7.0
 // @description  Entfernt Werbung in der YouTube-TV-Oberflaeche, SponsorBlock, Touch-Steuerung und Vollbild fuer das iPad.
 // @match        *://*.youtube.com/*
 // @match        *://youtube.com/*
@@ -48,6 +48,7 @@
                                    // 'stretch' = füllt alles, Bild wird leicht verzerrt
                                    // 'contain' = Original mit schwarzen Balken
                                    // Umschalten auch per Knopf ⤢ (wird gemerkt)
+    hideToolbar: true,             // Adressleiste von Orion wegscrollen lassen
   };
 
   // ------------------------------------------------------------
@@ -171,18 +172,33 @@
   // ------------------------------------------------------------
   function applyFillStyles() {
     if (document.getElementById('yttv-fill-style')) return;
-    const css = [
-      'html, body {',
-      '  margin:0 !important; padding:0 !important;',
-      '  width:100% !important; height:100% !important;',
-      '  min-height:100dvh !important;',
-      '  overflow:hidden !important; background:#000 !important;',
-      '  overscroll-behavior:none !important;',
+    const common = [
+      '  margin:0 !important; padding:0 !important; background:#000 !important;',
       '  -webkit-touch-callout:none !important;', // kein Popup bei langem Drücken
       '  -webkit-user-select:none !important; user-select:none !important;',
       '  -webkit-tap-highlight-color:transparent !important;',
-      '}',
-    ].join('\n');
+    ];
+    let css;
+    if (CONFIG.hideToolbar) {
+      // Trick: Die Seite wird ein Stück scrollbar gemacht, die TV-Oberfläche
+      // bleibt aber fest stehen. Orion blendet seine Leiste beim Scrollen aus.
+      css = [
+        'html {', ...common,
+        '  height:auto !important; overflow-x:hidden !important; overflow-y:auto !important;',
+        '}',
+        'body {', ...common,
+        '  position:fixed !important; top:0 !important; left:0 !important;',
+        '  width:100% !important; height:100% !important; overflow:hidden !important;',
+        '}',
+      ].join('\n');
+    } else {
+      css = [
+        'html, body {', ...common,
+        '  width:100% !important; height:100% !important; min-height:100dvh !important;',
+        '  overflow:hidden !important; overscroll-behavior:none !important;',
+        '}',
+      ].join('\n');
+    }
     const style = document.createElement('style');
     style.id = 'yttv-fill-style';
     style.textContent = css;
@@ -196,6 +212,27 @@
       (document.head || document.documentElement).appendChild(vp);
     }
     vp.content = 'width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover';
+  }
+
+  // Unsichtbarer Platzhalter, damit sich die Seite scrollen lässt
+  let spacer = null;
+  function ensureSpacer() {
+    if (!CONFIG.hideToolbar) return;
+    if (!spacer) {
+      spacer = document.createElement('div');
+      spacer.id = 'yttv-spacer';
+      spacer.style.cssText = 'position:absolute;top:0;left:0;width:1px;' +
+        'height:calc(100vh + 400px);pointer-events:none;visibility:hidden;';
+    }
+    if (!spacer.isConnected) document.documentElement.appendChild(spacer);
+  }
+
+  // Ein Stück nach unten scrollen → Orion blendet die Leiste aus
+  function scrollToolbarAway() {
+    if (!CONFIG.hideToolbar) return;
+    if (window.scrollY < 100) {
+      try { window.scrollTo(0, 300); } catch (e) { /* ignorieren */ }
+    }
   }
 
   let wantFs = CONFIG.fullscreen;
@@ -641,6 +678,7 @@
   function buildUi() {
     const root = document.documentElement;
     applyFillStyles();
+    ensureSpacer();
 
     if (CONFIG.search && !searchBtn) {
       searchBtn = makeButton('yttv-search-btn', '🔍', 'right', 88);
@@ -748,6 +786,7 @@
 
     // Jede normale Berührung ist eine Chance, ins Vollbild zu gehen
     if (wantFs && !isFs()) enterFs(false);
+    scrollToolbarAway();
 
     const t = ev.changedTouches[0];
     const dx = t.clientX - sx;
@@ -798,6 +837,7 @@
     // Anpassung an die Bildschirmgröße regelmäßig prüfen (Seite lädt nach)
     applyFill();
     setInterval(applyFill, 1500);
+    setTimeout(scrollToolbarAway, 800);
   }
 
   if (document.readyState === 'loading') {
