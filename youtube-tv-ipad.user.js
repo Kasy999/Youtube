@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube TV iPad - Werbefrei und Vollbild
 // @namespace    yt-tv-ipad
-// @version      1.4.0
+// @version      1.6.0
 // @description  Entfernt Werbung in der YouTube-TV-Oberflaeche, SponsorBlock, Touch-Steuerung und Vollbild fuer das iPad.
 // @match        *://*.youtube.com/*
 // @match        *://youtube.com/*
@@ -39,6 +39,15 @@
     tapAsEnter: false,             // true, falls Antippen nichts auswählt
     longPressMs: 600,              // so lange drücken, bis die Knöpfe erscheinen
     hideAfterMs: 2000,             // Knöpfe verschwinden nach dieser Zeit wieder
+    search: true,                  // eigenes Suchfeld mit iPad-Tastatur
+    autoSearchField: true,         // Suchfeld automatisch auf der Suchseite zeigen
+    searchMode: 'url',             // 'url' = Suchergebnisse direkt öffnen,
+                                   // 'keys' = Text in die TV-Suche „eintippen"
+    fillMode: 'cover',             // Anpassung an den Bildschirm (ohne schwarze Balken):
+                                   // 'cover'   = füllt alles, Ränder werden leicht abgeschnitten
+                                   // 'stretch' = füllt alles, Bild wird leicht verzerrt
+                                   // 'contain' = Original mit schwarzen Balken
+                                   // Umschalten auch per Knopf ⤢ (wird gemerkt)
   };
 
   // ------------------------------------------------------------
@@ -236,6 +245,110 @@
   }
 
   // ------------------------------------------------------------
+  // 3b) AN DIE BILDSCHIRMGRÖSSE ANPASSEN (keine schwarzen Balken)
+  // Die TV-Oberfläche zeichnet sich als 16:9-Fläche („Bühne") und
+  // setzt sie mittig mit Balken in den Bildschirm. Wir suchen diese
+  // Fläche und skalieren die Seite so, dass sie den ganzen
+  // Bildschirm füllt – passend zu iPad, iPhone, Hoch- und Querformat.
+  // ------------------------------------------------------------
+  const FILL_MODES = ['cover', 'stretch', 'contain'];
+  const FILL_NAMES = { cover: 'Füllen (Ränder abgeschnitten)', stretch: 'Strecken', contain: 'Original mit Balken' };
+  let fillMode = CONFIG.fillMode;
+  try {
+    const saved = localStorage.getItem('yttv-fill-mode');
+    if (FILL_MODES.indexOf(saved) !== -1) fillMode = saved;
+  } catch (e) { /* ignorieren */ }
+
+  // aktuell von uns angewendete Transformation (zum Zurückrechnen)
+  let cur = { tx: 0, ty: 0, sx: 1, sy: 1 };
+
+  // Rechteck eines Elements OHNE unsere Skalierung
+  function rawRect(el) {
+    const r = el.getBoundingClientRect();
+    return {
+      left: (r.left - cur.tx) / cur.sx,
+      top: (r.top - cur.ty) / cur.sy,
+      width: r.width / cur.sx,
+      height: r.height / cur.sy,
+    };
+  }
+
+  // Die 16:9-Bühne der TV-Oberfläche finden
+  function findStage(vw, vh) {
+    const body = document.body;
+    if (!body) return null;
+    let best = null, bestArea = 0;
+    (function walk(el, depth) {
+      if (depth > 6) return;
+      const kids = el.children;
+      for (let i = 0; i < kids.length; i++) {
+        const c = kids[i];
+        if (c.id && c.id.indexOf('yttv-') === 0) continue;
+        const r = rawRect(c);
+        if (r.width > 0 && r.height > 0) {
+          const ar = r.width / r.height;
+          const area = r.width * r.height;
+          if (ar > 1.70 && ar < 1.85 && area > vw * vh * 0.35 && area > bestArea) {
+            best = r; bestArea = area;
+          }
+        }
+        walk(c, depth + 1);
+      }
+    })(body, 0);
+    return best;
+  }
+
+  function setTransform(t) {
+    const body = document.body;
+    if (!body) return;
+    const same = Math.abs(t.tx - cur.tx) < 0.5 && Math.abs(t.ty - cur.ty) < 0.5 &&
+      Math.abs(t.sx - cur.sx) < 0.001 && Math.abs(t.sy - cur.sy) < 0.001;
+    if (same && body.style.transform) return;
+    cur = t;
+    if (t.sx === 1 && t.sy === 1 && t.tx === 0 && t.ty === 0) {
+      body.style.transform = '';
+      return;
+    }
+    body.style.transformOrigin = '0 0';
+    body.style.transform = 'translate(' + t.tx + 'px,' + t.ty + 'px) scale(' + t.sx + ',' + t.sy + ')';
+  }
+
+  function applyFill() {
+    const vw = window.innerWidth, vh = window.innerHeight;
+    if (!vw || !vh) return;
+    // Hochformat (v. a. iPhone): Füllen würde fast alles abschneiden
+    if (fillMode === 'contain' || vh > vw) { setTransform({ tx: 0, ty: 0, sx: 1, sy: 1 }); return; }
+
+    const r = findStage(vw, vh);
+    if (!r) { setTransform({ tx: 0, ty: 0, sx: 1, sy: 1 }); return; }
+    // Bühne füllt den Bildschirm schon (Seitenverhältnis passt) → nichts tun
+    if (Math.abs(r.width - vw) < 2 && Math.abs(r.height - vh) < 2) {
+      setTransform({ tx: 0, ty: 0, sx: 1, sy: 1 }); return;
+    }
+
+    let sx, sy;
+    if (fillMode === 'stretch') {
+      sx = vw / r.width; sy = vh / r.height;
+    } else {
+      sx = sy = Math.max(vw / r.width, vh / r.height);
+    }
+    // Bühne mittig auf den Bildschirm legen
+    const tx = (vw - sx * r.width) / 2 - sx * r.left;
+    const ty = (vh - sy * r.height) / 2 - sy * r.top;
+    setTransform({ tx: tx, ty: ty, sx: sx, sy: sy });
+  }
+
+  function cycleFillMode() {
+    fillMode = FILL_MODES[(FILL_MODES.indexOf(fillMode) + 1) % FILL_MODES.length];
+    try { localStorage.setItem('yttv-fill-mode', fillMode); } catch (e) { /* ignorieren */ }
+    applyFill();
+    toast('Anzeige: ' + FILL_NAMES[fillMode]);
+  }
+
+  window.addEventListener('resize', function () { setTimeout(applyFill, 100); });
+  window.addEventListener('orientationchange', function () { setTimeout(applyFill, 300); });
+
+  // ------------------------------------------------------------
   // 4) TASTEN DER FERNBEDIENUNG NACHBILDEN
   // ------------------------------------------------------------
   const KEYS = {
@@ -270,16 +383,18 @@
   // ------------------------------------------------------------
   let fsBtn = null;
   let backBtn = null;
+  let searchBtn = null;
+  let fillBtn = null;
   let toastEl = null;
   let hideTimer = null;
 
-  function makeButton(id, label, side) {
+  function makeButton(id, label, side, offsetPx) {
     const b = document.createElement('div');
     b.id = id;
     b.textContent = label;
     b.style.cssText = [
       'position:fixed', 'top:calc(16px + env(safe-area-inset-top))',
-      side + ':calc(16px + env(safe-area-inset-' + side + '))',
+      side + ':calc(' + (offsetPx || 16) + 'px + env(safe-area-inset-' + side + '))',
       'z-index:2147483647',
       'width:60px', 'height:60px', 'border-radius:30px',
       'background:rgba(0,0,0,0.75)', 'color:#fff', 'font-size:30px',
@@ -293,7 +408,7 @@
   }
 
   function showControls() {
-    [fsBtn, backBtn].forEach(function (b) {
+    [fsBtn, backBtn, searchBtn, fillBtn].forEach(function (b) {
       if (!b) return;
       b.style.opacity = '1';
       b.style.pointerEvents = 'auto';
@@ -302,7 +417,7 @@
   }
 
   function hideControls() {
-    [fsBtn, backBtn].forEach(function (b) {
+    [fsBtn, backBtn, searchBtn, fillBtn].forEach(function (b) {
       if (!b) return;
       b.style.opacity = '0';
       b.style.pointerEvents = 'none';
@@ -345,9 +460,206 @@
     sendKey(KEYS.back);
   }
 
+  // ------------------------------------------------------------
+  // 5b) SUCHFELD MIT iPAD-TASTATUR
+  // Die TV-Suche hat nur eine Bildschirmtastatur für die
+  // Fernbedienung. Wir legen ein echtes Textfeld darüber:
+  //   - erscheint automatisch auf der Suchseite (oder über 🔍)
+  //   - Eingabetaste/„Suchen" startet die Suche
+  // ------------------------------------------------------------
+  let searchBox = null;
+  let searchInput = null;
+  let searchDismissedFor = null;   // auf dieser Seite vom Nutzer geschlossen
+  let lastSubmit = 0;
+
+  function isSearchPage() {
+    return /^#\/search/.test(location.hash);
+  }
+
+  function buildSearchBox() {
+    const box = document.createElement('form');
+    box.id = 'yttv-search-box';
+    box.setAttribute('action', '#');
+    box.style.cssText = [
+      'position:fixed', 'top:calc(16px + env(safe-area-inset-top))',
+      'left:50%', 'transform:translateX(-50%)',
+      'z-index:2147483647', 'display:none', 'align-items:center', 'gap:8px',
+      'width:min(640px, calc(100vw - 200px))', 'padding:8px',
+      'background:rgba(20,20,20,0.92)', 'border-radius:16px',
+      'border:2px solid rgba(255,255,255,0.5)',
+      'box-shadow:0 6px 24px rgba(0,0,0,0.6)',
+    ].join(';');
+
+    const input = document.createElement('input');
+    input.id = 'yttv-search-input';
+    input.type = 'search';
+    input.placeholder = 'YouTube durchsuchen …';
+    input.setAttribute('enterkeyhint', 'search');
+    input.setAttribute('autocomplete', 'off');
+    input.setAttribute('autocorrect', 'off');
+    input.setAttribute('autocapitalize', 'off');
+    input.setAttribute('spellcheck', 'false');
+    input.style.cssText = [
+      'flex:1', 'min-width:0', 'height:48px', 'padding:0 14px',
+      'font:20px -apple-system,sans-serif', 'color:#fff',
+      'background:#333', 'border:none', 'border-radius:10px', 'outline:none',
+      '-webkit-user-select:text', 'user-select:text', '-webkit-touch-callout:default',
+      '-webkit-appearance:none', 'appearance:none',
+    ].join(';');
+
+    const go = document.createElement('button');
+    go.type = 'submit';
+    go.textContent = 'Suchen';
+    go.style.cssText = [
+      'height:48px', 'padding:0 16px', 'font:18px -apple-system,sans-serif',
+      'color:#fff', 'background:#c00', 'border:none', 'border-radius:10px',
+    ].join(';');
+
+    const close = document.createElement('button');
+    close.type = 'button';
+    close.textContent = '✕';
+    close.style.cssText = [
+      'height:48px', 'width:48px', 'font:20px -apple-system,sans-serif',
+      'color:#fff', 'background:#555', 'border:none', 'border-radius:10px',
+    ].join(';');
+    close.addEventListener('click', function (ev) {
+      ev.preventDefault();
+      searchDismissedFor = location.hash;
+      closeSearch();
+    });
+
+    box.addEventListener('submit', function (ev) {
+      ev.preventDefault();
+      submitSearch();
+    });
+
+    box.appendChild(input);
+    box.appendChild(go);
+    box.appendChild(close);
+    searchBox = box;
+    searchInput = input;
+    return box;
+  }
+
+  function openSearch(focus) {
+    if (!searchBox) return;
+    searchBox.style.display = 'flex';
+    if (focus) {
+      // Muss direkt im Tipp-Ereignis passieren, sonst zeigt iOS keine Tastatur
+      try { searchInput.focus(); } catch (e) { /* ignorieren */ }
+    }
+  }
+
+  function closeSearch() {
+    if (!searchBox) return;
+    try { searchInput.blur(); } catch (e) { /* ignorieren */ }
+    searchBox.style.display = 'none';
+  }
+
+  function isSearchOpen() {
+    return !!(searchBox && searchBox.style.display !== 'none');
+  }
+
+  function sendChar(ch) {
+    const target = document.activeElement && document.activeElement !== searchInput
+      ? document.activeElement : (document.body || document.documentElement);
+    const upper = ch.toUpperCase();
+    const keyCode = ch === ' ' ? 32 : (/[A-Z0-9]/.test(upper) ? upper.charCodeAt(0) : ch.charCodeAt(0));
+    ['keydown', 'keypress', 'keyup'].forEach(function (type) {
+      const ev = new KeyboardEvent(type, { key: ch, bubbles: true, cancelable: true });
+      try {
+        Object.defineProperty(ev, 'keyCode', { get: function () { return type === 'keypress' ? ch.charCodeAt(0) : keyCode; } });
+        Object.defineProperty(ev, 'which', { get: function () { return type === 'keypress' ? ch.charCodeAt(0) : keyCode; } });
+        Object.defineProperty(ev, 'charCode', { get: function () { return type === 'keypress' ? ch.charCodeAt(0) : 0; } });
+      } catch (e) { /* ignorieren */ }
+      target.dispatchEvent(ev);
+    });
+  }
+
+  function typeIntoTv(text) {
+    const chars = Array.from(text);
+    chars.forEach(function (ch, i) {
+      setTimeout(function () { sendChar(ch); }, i * 50);
+    });
+    setTimeout(function () { sendKey(KEYS.enter); }, chars.length * 50 + 150);
+  }
+
+  function submitSearch() {
+    const now = Date.now();
+    if (now - lastSubmit < 800) return; // Enter + submit nicht doppelt
+    lastSubmit = now;
+    const q = (searchInput.value || '').trim();
+    if (!q) return;
+    closeSearch();
+    searchInput.value = '';
+    if (CONFIG.searchMode === 'keys') {
+      typeIntoTv(q);
+    } else {
+      searchDismissedFor = '#/search?q=' + encodeURIComponent(q);
+      location.hash = searchDismissedFor;
+    }
+    toast('Suche: ' + q);
+  }
+
+  function onSearchButton() {
+    if (isSearchOpen()) closeSearch();
+    else openSearch(true);
+  }
+
+  // Tastendrücke im Suchfeld NICHT an die TV-Oberfläche weitergeben,
+  // sonst springt dort beim Tippen die Auswahl herum.
+  // (Läuft vor allen Listenern der Seite, weil das Skript zuerst startet.)
+  ['keydown', 'keypress', 'keyup'].forEach(function (type) {
+    window.addEventListener(type, function (ev) {
+      if (!ev.isTrusted || !searchInput || ev.target !== searchInput) return;
+      ev.stopImmediatePropagation();
+      if (type === 'keydown' && (ev.key === 'Enter' || ev.keyCode === 13)) {
+        ev.preventDefault();
+        submitSearch();
+      } else if (type === 'keydown' && (ev.key === 'Escape' || ev.keyCode === 27)) {
+        ev.preventDefault();
+        searchDismissedFor = location.hash;
+        closeSearch();
+      }
+    }, true);
+  });
+
+  // Suchfeld automatisch auf der Suchseite zeigen
+  function syncSearchWithPage() {
+    if (!CONFIG.search || !searchBox) return;
+    if (isSearchPage()) {
+      if (CONFIG.autoSearchField && !isSearchOpen() && searchDismissedFor !== location.hash) {
+        openSearch(false); // Tastatur kommt beim Antippen des Felds
+      }
+    } else if (isSearchOpen() && document.activeElement !== searchInput) {
+      closeSearch();
+      searchDismissedFor = null;
+    }
+  }
+  window.addEventListener('hashchange', syncSearchWithPage);
+
   function buildUi() {
     const root = document.documentElement;
     applyFillStyles();
+
+    if (CONFIG.search && !searchBtn) {
+      searchBtn = makeButton('yttv-search-btn', '🔍', 'right', 88);
+      const h = buttonHandler(onSearchButton);
+      searchBtn.addEventListener('touchend', h, true);
+      searchBtn.addEventListener('click', h, true);
+    }
+    if (CONFIG.search && !searchBox) buildSearchBox();
+    if (!fillBtn) {
+      fillBtn = makeButton('yttv-fill-btn', '⤢', 'right', CONFIG.search ? 160 : 88);
+      const h = buttonHandler(cycleFillMode);
+      fillBtn.addEventListener('touchend', h, true);
+      fillBtn.addEventListener('click', h, true);
+    }
+    if (!fillBtn.isConnected) root.appendChild(fillBtn);
+    [searchBtn, searchBox].forEach(function (el) {
+      if (el && !el.isConnected) root.appendChild(el);
+    });
+    syncSearchWithPage();
 
     if (!fsBtn) {
       fsBtn = makeButton('yttv-fs-btn', '⛶', 'right');
@@ -389,7 +701,7 @@
   //   vom linken Rand nach rechts wischen → Zurück
   // ------------------------------------------------------------
   function isOwnUi(el) {
-    return el && el.closest && el.closest('#yttv-fs-btn, #yttv-back-btn');
+    return el && el.closest && el.closest('#yttv-fs-btn, #yttv-back-btn, #yttv-search-btn, #yttv-fill-btn, #yttv-search-box');
   }
 
   let sx = 0, sy = 0, st = 0;
@@ -470,16 +782,22 @@
   }, { capture: true, passive: true });
 
   // Kontextmenü/Lupe bei langem Drücken unterdrücken
-  document.addEventListener('contextmenu', function (ev) { ev.preventDefault(); }, true);
+  document.addEventListener('contextmenu', function (ev) {
+    if (isOwnUi(ev.target)) return; // im Suchfeld Einfügen-Menü erlauben
+    ev.preventDefault();
+  }, true);
 
   // ------------------------------------------------------------
   // START
   // ------------------------------------------------------------
   function start() {
     buildUi();
-    toast('✓ TV-Skript aktiv – lange drücken für Knöpfe', 3500);
+    toast('✓ TV-Skript aktiv – lange drücken für Knöpfe (← ⤢ 🔍 ⛶)', 3500);
     // Falls die Seite unsere Elemente entfernt: jede Sekunde wieder einfügen
     setInterval(buildUi, 1000);
+    // Anpassung an die Bildschirmgröße regelmäßig prüfen (Seite lädt nach)
+    applyFill();
+    setInterval(applyFill, 1500);
   }
 
   if (document.readyState === 'loading') {
