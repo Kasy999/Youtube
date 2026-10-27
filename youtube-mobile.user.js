@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube Mobile - Werbefrei und Hintergrund-Wiedergabe
 // @namespace    yt-mobile-ipad
-// @version      1.0.0
+// @version      1.2.0
 // @description  Entfernt Werbung auf m.youtube.com, SponsorBlock und Wiedergabe bei gesperrtem Bildschirm oder im Hintergrund.
 // @match        *://m.youtube.com/*
 // @match        *://www.youtube.com/*
@@ -36,6 +36,8 @@
     ],
     backgroundPlay: true,          // weiterspielen bei gesperrtem Display / im Hintergrund
     lockScreenControls: true,      // Steuerung auf dem Sperrbildschirm
+    scaleButton: true,             // Knopf ⤢ zum Anpassen der Größe
+    scaleSteps: [1, 0.9, 0.8, 0.7, 0.6, 0.5], // Größenstufen (1 = Original)
   };
 
   // ------------------------------------------------------------
@@ -274,12 +276,16 @@
       const byUser = Date.now() - userPausedAt < 1500;
       const ended = video.ended;
       if (byUser || ended) { wasPlaying = false; return; }
-      // Pause kam nicht von dir → im Hintergrund wieder starten
+      // Pause kam nicht von dir → im Hintergrund mehrmals neu versuchen
       if (wasPlaying && reallyHidden()) {
-        setTimeout(function () {
-          const p = video.play();
-          if (p && p.catch) p.catch(function () {});
-        }, 50);
+        [50, 300, 800, 1500, 3000].forEach(function (delay) {
+          setTimeout(function () {
+            if (!video.paused || video.ended) return;
+            if (Date.now() - userPausedAt < 1500) return;
+            const p = video.play();
+            if (p && p.catch) p.catch(function () {});
+          }, delay);
+        });
       }
     }, true);
 
@@ -301,32 +307,123 @@
   // Titel/Kanal anzeigen und Play/Pause/Spulen ermöglichen.
   // Falls die Wiedergabe beim Sperren doch stoppt: hier auf ▶︎.
   // ------------------------------------------------------------
+  // Video-Links auf der Seite, die nicht das aktuelle Video sind
+  function watchLinks() {
+    const cur = getVideoId();
+    const out = [];
+    const seen = {};
+    document.querySelectorAll('a[href*="/watch?v="]').forEach(function (a) {
+      const m = a.getAttribute('href').match(/[?&]v=([\w-]{11})/);
+      if (!m) return;
+      if (a.closest('header, ytm-mobile-topbar-renderer, #ytm-scale-btn')) return;
+      out.push({ a: a, id: m[1], current: m[1] === cur, href: a.getAttribute('href') });
+      seen[m[1]] = true;
+    });
+    return out;
+  }
+
+  function playlistId() {
+    const m = location.search.match(/[?&]list=([\w-]+)/);
+    return m ? m[1] : null;
+  }
+
+  function goNext() {
+    const v = document.querySelector('video');
+    const links = watchLinks();
+    const list = playlistId();
+
+    // 1) In einer Playlist: das nächste Video der Playlist
+    if (list) {
+      const inList = links.filter(function (l) { return l.href.indexOf('list=' + list) !== -1; });
+      const idx = inList.findIndex(function (l) { return l.current; });
+      for (let i = idx + 1; i < inList.length; i++) {
+        if (!inList[i].current) { inList[i].a.click(); return; }
+      }
+    }
+    // 2) Sonst: das erste empfohlene Video unter dem Player
+    const rec = links.find(function (l) {
+      return !l.current && l.a.closest(
+        'ytm-single-column-watch-next-results-renderer, ytm-watch-next-secondary-results-renderer, ' +
+        'ytm-item-section-renderer, ytm-compact-video-renderer, ytm-video-with-context-renderer');
+    }) || links.find(function (l) { return !l.current; });
+    if (rec) { rec.a.click(); return; }
+    toast('Kein nächstes Video gefunden');
+    if (v) v.currentTime = v.duration || v.currentTime;
+  }
+
+  function goPrevious() {
+    const v = document.querySelector('video');
+    // Wie bei Musik-Apps: erst an den Anfang, beim zweiten Druck zurück
+    if (v && v.currentTime > 3) { v.currentTime = 0; return; }
+    history.back();
+  }
+
   if (CONFIG.lockScreenControls && 'mediaSession' in navigator) {
     const ms = navigator.mediaSession;
     const getVideo = function () { return document.querySelector('video'); };
-    const safe = function (action, fn) {
-      try { ms.setActionHandler(action, fn); } catch (e) { /* nicht unterstützt */ }
+
+    // Unsere Tasten dürfen nicht von YouTube überschrieben werden.
+    // Wichtig: iOS zeigt „10 s spulen" STATT „vorheriges/nächstes",
+    // sobald Spul-Tasten gesetzt sind – deshalb blockieren wir diese.
+    const OURS = ['play', 'pause', 'previoustrack', 'nexttrack', 'seekto'];
+    const BLOCKED = ['seekbackward', 'seekforward'];
+    try {
+      const proto = Object.getPrototypeOf(ms);
+      const origSet = proto.setActionHandler;
+      proto.setActionHandler = function (action, handler) {
+        if (BLOCKED.indexOf(action) !== -1) {
+          return origSet.call(this, action, null);
+        }
+        if (OURS.indexOf(action) !== -1 && !(handler && handler.__ytmOurs)) return;
+        return origSet.call(this, action, handler);
+      };
+    } catch (e) { /* ignorieren */ }
+
+    const handlers = {
+      play: function () {
+        const v = getVideo();
+        if (v) { const p = v.play(); if (p && p.catch) p.catch(function () {}); }
+      },
+      pause: function () { const v = getVideo(); if (v) v.pause(); },
+      previoustrack: function () { goPrevious(); },
+      nexttrack: function () { goNext(); },
+      seekto: function (d) {
+        const v = getVideo(); if (v && d && typeof d.seekTime === 'number') v.currentTime = d.seekTime;
+      },
     };
 
-    safe('play', function () {
-      const v = getVideo();
-      if (v) { const p = v.play(); if (p && p.catch) p.catch(function () {}); }
-    });
-    safe('pause', function () { const v = getVideo(); if (v) v.pause(); });
-    safe('seekbackward', function (d) {
-      const v = getVideo(); if (v) v.currentTime = Math.max(0, v.currentTime - ((d && d.seekOffset) || 10));
-    });
-    safe('seekforward', function (d) {
-      const v = getVideo(); if (v) v.currentTime = Math.min(v.duration || 1e9, v.currentTime + ((d && d.seekOffset) || 10));
-    });
-    safe('seekto', function (d) {
-      const v = getVideo(); if (v && d && typeof d.seekTime === 'number') v.currentTime = d.seekTime;
-    });
+    function registerHandlers() {
+      Object.keys(handlers).forEach(function (action) {
+        const fn = handlers[action];
+        fn.__ytmOurs = true;
+        try { ms.setActionHandler(action, fn); } catch (e) { /* nicht unterstützt */ }
+      });
+      BLOCKED.forEach(function (action) {
+        try { ms.setActionHandler(action, null); } catch (e) { /* ignorieren */ }
+      });
+    }
+    registerHandlers();
 
     let lastTitle = '';
     setInterval(function () {
       const v = getVideo();
-      if (!v || v.paused || typeof MediaMetadata === 'undefined') return;
+      if (!v) return;
+      // Tasten regelmäßig erneuern, falls sie verloren gehen
+      registerHandlers();
+
+      // Fortschrittsbalken auf dem Sperrbildschirm
+      try {
+        if (ms.setPositionState && isFinite(v.duration) && v.duration > 0) {
+          ms.setPositionState({
+            duration: v.duration,
+            playbackRate: v.playbackRate || 1,
+            position: Math.min(v.currentTime, v.duration),
+          });
+        }
+        ms.playbackState = v.paused ? 'paused' : 'playing';
+      } catch (e) { /* ignorieren */ }
+
+      if (v.paused || typeof MediaMetadata === 'undefined') return;
       const title = (document.title || '').replace(/\s*-\s*YouTube\s*$/, '');
       if (!title || title === lastTitle) return;
       lastTitle = title;
@@ -340,8 +437,130 @@
           artwork: id ? [{ src: 'https://i.ytimg.com/vi/' + id + '/hqdefault.jpg', sizes: '480x360', type: 'image/jpeg' }] : [],
         });
       } catch (e) { /* ignorieren */ }
-    }, 2000);
+    }, 1000);
   }
+
+  // ------------------------------------------------------------
+  // 5) GRÖSSE AN DEN BILDSCHIRM ANPASSEN
+  // Die mobile Seite ist für Handys gebaut und wirkt auf dem iPad
+  // riesig. Mit dem Knopf ⤢ wählst du eine kleinere Stufe: Die
+  // Seite wird dann so aufgebaut, als wäre der Bildschirm breiter,
+  // und zeigt mehr Inhalt. Die Stufe wird gemerkt.
+  // ------------------------------------------------------------
+  let scale = 1;
+  try {
+    const saved = parseFloat(localStorage.getItem('ytm-scale'));
+    if (saved > 0 && saved <= 1) scale = saved;
+  } catch (e) { /* ignorieren */ }
+
+  let useZoomFallback = false;
+
+  function screenWidthNow() {
+    const landscape = Math.abs(window.orientation || 0) === 90 ||
+      (screen.orientation && /landscape/.test(screen.orientation.type));
+    return landscape ? Math.max(screen.width, screen.height) : Math.min(screen.width, screen.height);
+  }
+
+  function viewportContent(s) {
+    return 'width=device-width, initial-scale=' + s + ', minimum-scale=' + s +
+      ', maximum-scale=' + Math.min(5, s * 5) + ', viewport-fit=cover';
+  }
+
+  function getViewportMeta() {
+    let vp = document.querySelector('meta[name="viewport"]');
+    if (!vp && document.head) {
+      vp = document.createElement('meta');
+      vp.name = 'viewport';
+      document.head.appendChild(vp);
+    }
+    return vp;
+  }
+
+  function applyScale() {
+    const vp = getViewportMeta();
+    const root = document.documentElement;
+    if (useZoomFallback) {
+      // Ausweichweg: Seite per CSS verkleinern
+      if (vp && vp.content !== viewportContent(1)) vp.content = viewportContent(1);
+      root.style.zoom = scale === 1 ? '' : String(scale);
+      return;
+    }
+    root.style.zoom = '';
+    if (vp && vp.content !== viewportContent(scale)) vp.content = viewportContent(scale);
+  }
+
+  // Prüfen, ob der Browser die Viewport-Änderung umgesetzt hat
+  function verifyScale() {
+    if (useZoomFallback || scale === 1) return;
+    const expected = screenWidthNow() / scale;
+    if (window.innerWidth < expected * 0.85) {
+      useZoomFallback = true;
+      applyScale();
+    }
+  }
+
+  function setScale(s) {
+    scale = s;
+    try { localStorage.setItem('ytm-scale', String(s)); } catch (e) { /* ignorieren */ }
+    applyScale();
+    setTimeout(verifyScale, 400);
+    toast('Größe: ' + Math.round(s * 100) + ' %');
+  }
+
+  function nextScale() {
+    const steps = CONFIG.scaleSteps;
+    let i = steps.indexOf(scale);
+    if (i === -1) i = 0;
+    setScale(steps[(i + 1) % steps.length]);
+  }
+
+  // Knopf: unten rechts, verblasst nach kurzer Zeit
+  let scaleBtn = null;
+  let fadeTimer = null;
+  function brightenButton() {
+    if (!scaleBtn) return;
+    scaleBtn.style.opacity = '0.95';
+    clearTimeout(fadeTimer);
+    fadeTimer = setTimeout(function () { scaleBtn.style.opacity = '0.35'; }, 2500);
+  }
+
+  function buildScaleButton() {
+    if (!CONFIG.scaleButton) return;
+    if (!scaleBtn) {
+      scaleBtn = document.createElement('div');
+      scaleBtn.id = 'ytm-scale-btn';
+      scaleBtn.textContent = '⤢';
+      scaleBtn.style.cssText = [
+        'position:fixed', 'right:calc(14px + env(safe-area-inset-right))',
+        'bottom:calc(110px + env(safe-area-inset-bottom))', 'z-index:2147483647',
+        'width:48px', 'height:48px', 'border-radius:24px',
+        'background:rgba(0,0,0,0.75)', 'color:#fff', 'font-size:24px',
+        'border:2px solid rgba(255,255,255,0.7)', 'box-shadow:0 3px 12px rgba(0,0,0,0.4)',
+        'display:flex', 'align-items:center', 'justify-content:center',
+        'opacity:0.35', 'transition:opacity .25s', 'cursor:pointer',
+        '-webkit-user-select:none', 'user-select:none', '-webkit-touch-callout:none',
+      ].join(';');
+      let last = 0;
+      const onTap = function (ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        const now = Date.now();
+        if (now - last < 500) return;
+        last = now;
+        nextScale();
+        brightenButton();
+      };
+      scaleBtn.addEventListener('touchend', onTap, true);
+      scaleBtn.addEventListener('click', onTap, true);
+    }
+    if (!scaleBtn.isConnected) document.documentElement.appendChild(scaleBtn);
+  }
+
+  document.addEventListener('touchstart', brightenButton, { capture: true, passive: true });
+  window.addEventListener('resize', function () { setTimeout(applyScale, 100); });
+  window.addEventListener('orientationchange', function () {
+    setTimeout(function () { applyScale(); verifyScale(); }, 300);
+  });
 
   // ------------------------------------------------------------
   // Kleine Hinweis-Einblendung
@@ -366,7 +585,18 @@
     toastEl._t = setTimeout(function () { toastEl.style.opacity = '0'; }, ms || 2500);
   }
 
-  document.addEventListener('DOMContentLoaded', function () {
-    toast('✓ YouTube-Skript aktiv', 2500);
-  });
+  function start() {
+    applyScale();
+    setTimeout(verifyScale, 600);
+    buildScaleButton();
+    // YouTube setzt den Viewport teils neu – regelmäßig nachziehen
+    setInterval(function () { applyScale(); buildScaleButton(); }, 1000);
+    toast('✓ YouTube-Skript aktiv – Größe mit ⤢ anpassen', 3000);
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', start);
+  } else {
+    start();
+  }
 })();
