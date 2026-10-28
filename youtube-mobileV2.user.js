@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube Mobile - Werbefrei und Hintergrund-Wiedergabe
 // @namespace    yt-mobile-ipad
-// @version      1.2.1
+// @version      1.4.1
 // @description  Entfernt Werbung auf m.youtube.com, SponsorBlock und Wiedergabe bei gesperrtem Bildschirm oder im Hintergrund.
 // @match        *://m.youtube.com/*
 // @match        *://www.youtube.com/*
@@ -18,6 +18,10 @@
 
   // Die TV-Oberfläche hat ihr eigenes Skript
   if (/^\/tv(\/|$)/.test(location.pathname)) return;
+
+  // Läuft das Skript in der Stöber-Ebene des Mini-Players?
+  let IN_BROWSE_FRAME = false;
+  try { IN_BROWSE_FRAME = window.top !== window && window.name === 'ytm-browse'; } catch (e) { IN_BROWSE_FRAME = true; }
 
   // ------------------------------------------------------------
   // EINSTELLUNGEN
@@ -38,7 +42,20 @@
     lockScreenControls: true,      // Steuerung auf dem Sperrbildschirm
     scaleButton: true,             // Knopf ⤢ zum Anpassen der Größe
     scaleSteps: [1, 0.9, 0.8, 0.7, 0.6, 0.5], // Größenstufen (1 = Original)
+    rotateFullscreen: true,        // Querformat drehen = Vollbild
+    tapRealFullscreen: true,       // im Vollbild antippen = echtes Vollbild ohne Adressleiste
+    miniPlayer: true,              // Video nach unten ziehen = Mini-Player
   };
+
+  // In der Stöber-Ebene nur den Werbeblocker nutzen
+  if (IN_BROWSE_FRAME) {
+    CONFIG.sponsorblock = false;
+    CONFIG.backgroundPlay = false;
+    CONFIG.lockScreenControls = false;
+    CONFIG.scaleButton = false;
+    CONFIG.rotateFullscreen = false;
+    CONFIG.miniPlayer = false;
+  }
 
   // ------------------------------------------------------------
   // 1) WERBEBLOCKER
@@ -141,6 +158,7 @@
     ].join(',\n') + ' { display:none !important; }';
 
     function injectCss() {
+      if (!document.documentElement) { setTimeout(injectCss, 10); return; }
       if (document.getElementById('ytm-ad-css')) return;
       const st = document.createElement('style');
       st.id = 'ytm-ad-css';
@@ -496,17 +514,29 @@
     return vp;
   }
 
+  function nativeFullscreen() {
+    if (document.fullscreenElement || document.webkitFullscreenElement) return true;
+    const v = document.querySelector('video');
+    return !!(v && v.webkitDisplayingFullscreen);
+  }
+
   function applyScale() {
+    if (IN_BROWSE_FRAME) return;
     const vp = getViewportMeta();
     const root = document.documentElement;
+    // Im Vollbild/Mini-Player immer Originalgröße, sonst wird der Player
+    // durch die Verkleinerung mitverkleinert und füllt den Schirm nicht
+    let busy = false;
+    try { busy = fsActive || miniActive || nativeFullscreen(); } catch (e) { /* noch nicht bereit */ }
+    const s = busy ? 1 : scale;
     if (useZoomFallback) {
       // Ausweichweg: Seite per CSS verkleinern
       if (vp && vp.content !== viewportContent(1)) vp.content = viewportContent(1);
-      root.style.zoom = scale === 1 ? '' : String(scale);
+      root.style.zoom = s === 1 ? '' : String(s);
       return;
     }
     root.style.zoom = '';
-    if (vp && vp.content !== viewportContent(scale)) vp.content = viewportContent(scale);
+    if (vp && vp.content !== viewportContent(s)) vp.content = viewportContent(s);
   }
 
   // Prüfen, ob der Browser die Viewport-Änderung umgesetzt hat
@@ -583,6 +613,497 @@
   });
 
   // ------------------------------------------------------------
+  // 6) QUERFORMAT = VOLLBILD
+  // Läuft ein Video im Hochformat und du drehst das Gerät quer,
+  // füllt der Player den ganzen Bildschirm. Zurück ins Hochformat
+  // = wieder wie vorher. (Nur beim Drehen, nicht beim Öffnen.)
+  // ------------------------------------------------------------
+  const PLAYER_SEL = '#player-container-id, .player-container, ytm-player';
+
+  function isWatchPage() { return location.pathname === '/watch'; }
+  function isPortrait() { return window.innerHeight >= window.innerWidth; }
+  function findPlayer() {
+    const els = document.querySelectorAll(PLAYER_SEL);
+    for (let i = 0; i < els.length; i++) {
+      if (els[i].querySelector('video')) return els[i];
+    }
+    const v = document.querySelector('video');
+    return v ? (v.closest('.html5-video-player') || v.parentElement) : null;
+  }
+  function nudgeLayout() {
+    // YouTube berechnet die Player-Größe beim „resize" neu
+    setTimeout(function () { window.dispatchEvent(new Event('resize')); }, 50);
+    setTimeout(function () { window.dispatchEvent(new Event('resize')); }, 400);
+  }
+
+  const PLAYER_CSS = [
+    // gemeinsame Regeln, damit das Video seinen Kasten ausfüllt
+    'html.ytm-fs .ytm-player-host, html.ytm-mini .ytm-player-host {',
+    '  position:fixed !important; margin:0 !important; padding:0 !important;',
+    '  transform:none !important; background:#000 !important;',
+    '}',
+    'html.ytm-fs .ytm-player-host *:not(video):not(.ytp-chrome-bottom):not(.ytp-chrome-bottom *),',
+    'html.ytm-mini .ytm-player-host #player, html.ytm-mini .ytm-player-host .html5-video-player,',
+    'html.ytm-mini .ytm-player-host .html5-video-container {',
+    '  max-width:none !important; max-height:none !important;',
+    '}',
+    'html.ytm-fs .ytm-player-host #player, html.ytm-fs .ytm-player-host .html5-video-player,',
+    'html.ytm-fs .ytm-player-host .html5-video-container,',
+    'html.ytm-mini .ytm-player-host #player, html.ytm-mini .ytm-player-host .html5-video-player,',
+    'html.ytm-mini .ytm-player-host .html5-video-container {',
+    '  width:100% !important; height:100% !important; padding:0 !important;',
+    '}',
+    'html.ytm-fs .ytm-player-host video, html.ytm-mini .ytm-player-host video {',
+    '  width:100% !important; height:100% !important; left:0 !important; top:0 !important;',
+    '  object-fit:contain !important;',
+    '}',
+    // Vollbild
+    'html.ytm-fs .ytm-player-host {',
+    '  top:0 !important; left:0 !important; right:0 !important; bottom:0 !important;',
+    '  width:100vw !important; height:100vh !important; height:100dvh !important;',
+    '  z-index:2147483640 !important;',
+    '}',
+    'html.ytm-fs, html.ytm-fs body { overflow:hidden !important; }',
+    'html.ytm-fs #ytm-scale-btn { display:none !important; }',
+    // Mini-Player unten rechts
+    'html.ytm-mini .ytm-player-host {',
+    '  top:auto !important; left:auto !important;',
+    '  right:calc(12px + env(safe-area-inset-right)) !important;',
+    '  bottom:calc(12px + env(safe-area-inset-bottom)) !important;',
+    '  width:46vw !important; height:calc(46vw * 9 / 16) !important;',
+    '  z-index:2147483641 !important; border-radius:10px !important; overflow:hidden !important;',
+    '  box-shadow:0 6px 24px rgba(0,0,0,0.55) !important;',
+    '}',
+    '@media (orientation: landscape) {',
+    '  html.ytm-mini .ytm-player-host { width:30vw !important; height:calc(30vw * 9 / 16) !important; }',
+    '}',
+    'html.ytm-mini .ytm-player-host .ytp-chrome-top, html.ytm-mini .ytm-player-host .ytp-chrome-bottom,',
+    'html.ytm-mini .ytm-player-host .player-controls-content, html.ytm-mini .ytm-player-host ytm-custom-control',
+    '  { display:none !important; }',
+    'html.ytm-mini #ytm-scale-btn { display:none !important; }',
+  ].join('\n');
+
+  function injectPlayerCss() {
+    if (document.getElementById('ytm-player-css')) return;
+    const st = document.createElement('style');
+    st.id = 'ytm-player-css';
+    st.textContent = PLAYER_CSS;
+    (document.head || document.documentElement).appendChild(st);
+  }
+
+  let playerHost = null;
+  function markHost() {
+    const p = findPlayer();
+    if (playerHost && playerHost !== p) playerHost.classList.remove('ytm-player-host');
+    playerHost = p;
+    if (p) p.classList.add('ytm-player-host');
+    return p;
+  }
+
+  let fsActive = false;
+  let fsExitBtn = null;
+
+  function enterLandscapeFs() {
+    if (fsActive || miniActive) return;
+    const v = document.querySelector('video');
+    if (!isWatchPage() || !v || !markHost()) return;
+    fsActive = true;
+    document.documentElement.classList.add('ytm-fs');
+    applyScale();
+    showFsExit();
+    nudgeLayout();
+    if (CONFIG.tapRealFullscreen) toast('Antippen für Vollbild ohne Adressleiste', 2500);
+  }
+
+  function exitLandscapeFs() {
+    if (!fsActive) return;
+    fsActive = false;
+    document.documentElement.classList.remove('ytm-fs');
+    if (fsExitBtn) fsExitBtn.style.display = 'none';
+    const fsEl = document.fullscreenElement || document.webkitFullscreenElement;
+    if (fsEl && fsEl === playerHost) {
+      const ex = document.exitFullscreen || document.webkitExitFullscreen;
+      try { const pr = ex.call(document); if (pr && pr.catch) pr.catch(function () {}); } catch (e) { /* ignorieren */ }
+    }
+    applyScale();
+    nudgeLayout();
+  }
+
+  // kleiner Knopf zum manuellen Verlassen (blendet sich aus)
+  function showFsExit() {
+    if (!fsExitBtn) {
+      fsExitBtn = document.createElement('div');
+      fsExitBtn.id = 'ytm-fs-exit';
+      fsExitBtn.textContent = '✕';
+      fsExitBtn.style.cssText = [
+        'position:fixed', 'top:calc(14px + env(safe-area-inset-top))',
+        'left:calc(14px + env(safe-area-inset-left))', 'z-index:2147483647',
+        'width:44px', 'height:44px', 'border-radius:22px', 'background:rgba(0,0,0,0.6)',
+        'color:#fff', 'font:20px -apple-system,sans-serif', 'display:flex',
+        'align-items:center', 'justify-content:center', 'transition:opacity .3s',
+        '-webkit-user-select:none', 'user-select:none',
+      ].join(';');
+      const onTap = function (ev) { ev.preventDefault(); ev.stopPropagation(); exitLandscapeFs(); };
+      fsExitBtn.addEventListener('touchend', onTap, true);
+      fsExitBtn.addEventListener('click', onTap, true);
+    }
+    if (!fsExitBtn.isConnected) document.documentElement.appendChild(fsExitBtn);
+    fsExitBtn.style.display = 'flex';
+    fsExitBtn.style.opacity = '1';
+    clearTimeout(fsExitBtn._t);
+    fsExitBtn._t = setTimeout(function () { fsExitBtn.style.opacity = '0'; }, 2500);
+  }
+
+  let wasPortrait = isPortrait();
+  function onOrientation() {
+    const portrait = isPortrait();
+    if (portrait === wasPortrait) return;
+    wasPortrait = portrait;
+    if (!CONFIG.rotateFullscreen) return;
+    // YouTubes eigenes Vollbild ist aktiv → nicht dazwischenfunken
+    if (nativeFullscreen()) { exitLandscapeFs(); return; }
+    if (!portrait) {
+      const v = document.querySelector('video');
+      if (v && !v.paused) enterLandscapeFs();
+    } else {
+      exitLandscapeFs();
+    }
+  }
+
+  // Echtes Vollbild (blendet die Adressleiste aus). Geht nur direkt
+  // nach einem Antippen – deshalb beim ersten Tippen im Dreh-Vollbild.
+  // 1. Versuch: ganzer Player im Vollbild (Seiten-Vollbild)
+  // 2. Versuch: nativer iPad/iPhone-Videoplayer
+  let preferVideoFs = false;
+  function requestRealFullscreen() {
+    const v = document.querySelector('video');
+    const el = playerHost;
+    const elFn = el && (el.requestFullscreen || el.webkitRequestFullscreen);
+    const allowed = document.fullscreenEnabled || document.webkitFullscreenEnabled;
+    if (!preferVideoFs && elFn && allowed) {
+      try {
+        const pr = elFn.call(el);
+        if (pr && pr.catch) pr.catch(function () { preferVideoFs = true; });
+      } catch (e) { preferVideoFs = true; }
+      // Hat es nicht geklappt, nimmt der nächste Tipp den Videoplayer
+      setTimeout(function () {
+        if (!nativeFullscreen()) {
+          preferVideoFs = true;
+          toast('Nochmal tippen', 1500);
+        }
+      }, 700);
+      return;
+    }
+    if (v && typeof v.webkitEnterFullscreen === 'function') {
+      try { v.webkitEnterFullscreen(); } catch (e) { /* ignorieren */ }
+    }
+  }
+
+  document.addEventListener('touchend', function (ev) {
+    if (!fsActive || !CONFIG.tapRealFullscreen || nativeFullscreen()) return;
+    if (fsExitBtn && fsExitBtn.contains(ev.target)) return;
+    if (!playerHost || !playerHost.contains(ev.target)) return;
+    requestRealFullscreen();
+  }, true);
+
+  // YouTubes Vollbild-Knopf abfangen, wenn der Browser kein Seiten-
+  // Vollbild erlaubt (sonst meldet YouTube „nicht unterstützt").
+  // Stattdessen öffnet sich das Video im Videoplayer des iPads.
+  const FS_BUTTON_SEL = [
+    '.fullscreen-icon', 'button.fullscreen-icon', '.ytp-fullscreen-button',
+    'ytm-fullscreen-button', '.player-controls-fullscreen',
+    'button[aria-label*="ollbild"]', 'button[aria-label*="ull screen"]',
+    'button[aria-label*="ullscreen"]',
+  ].join(',');
+  let lastFsTap = 0;
+  function onYtFullscreenButton(ev) {
+    if (IN_BROWSE_FRAME) return;
+    const t = ev.target;
+    const btn = t && t.closest && t.closest(FS_BUTTON_SEL);
+    if (!btn) return;
+    const allowed = document.fullscreenEnabled || document.webkitFullscreenEnabled;
+    if (allowed) return; // Browser kann es selbst → YouTube machen lassen
+    ev.preventDefault();
+    ev.stopImmediatePropagation();
+    const now = Date.now();
+    if (now - lastFsTap < 600) return;
+    lastFsTap = now;
+    const v = document.querySelector('video');
+    if (v && typeof v.webkitEnterFullscreen === 'function') {
+      try { v.webkitEnterFullscreen(); return; } catch (e) { /* weiter unten */ }
+    }
+    // letzter Ausweg: Player füllt die Seite (Adressleiste bleibt)
+    if (fsActive) exitLandscapeFs(); else { markHost(); enterLandscapeFs(); }
+  }
+  ['touchend', 'click', 'pointerup'].forEach(function (type) {
+    window.addEventListener(type, onYtFullscreenButton, true);
+  });
+
+  // YouTubes eigener Vollbild-Knopf: unseres abschalten, Größe richtig setzen
+  ['fullscreenchange', 'webkitfullscreenchange'].forEach(function (type) {
+    document.addEventListener(type, function () {
+      const fsEl = document.fullscreenElement || document.webkitFullscreenElement;
+      // Unser eigener Player im Vollbild → Dreh-Vollbild beibehalten
+      if (fsEl && playerHost && fsEl === playerHost) { applyScale(); return; }
+      // Vollbild beendet und Gerät steht hochkant → alles zurücksetzen
+      if (!fsEl && isPortrait()) exitLandscapeFs();
+      if (fsEl) exitLandscapeFs();
+      applyScale();
+      setTimeout(function () { wasPortrait = isPortrait(); }, 400);
+    }, true);
+  });
+  ['webkitbeginfullscreen', 'webkitendfullscreen'].forEach(function (type) {
+    document.addEventListener(type, function () {
+      if (type === 'webkitendfullscreen' && !isPortrait()) {
+        // zurück aus dem Videoplayer, Gerät noch quer → Dreh-Vollbild behalten
+        applyScale();
+        return;
+      }
+      exitLandscapeFs();
+      applyScale();
+      setTimeout(function () { wasPortrait = isPortrait(); }, 400);
+    }, true);
+  });
+
+  // ------------------------------------------------------------
+  // 7) MINI-PLAYER (wie in der YouTube-App)
+  // Im Hochformat das Video nach unten ziehen → es spielt klein
+  // unten rechts weiter, darüber kannst du normal weiterstöbern.
+  // Antippen des Mini-Players = wieder groß. ✕ = schließen.
+  // Technik: Die Videoseite bleibt im Hintergrund erhalten (damit
+  // das Video weiterläuft), zum Stöbern wird YouTube in einer
+  // Ebene darüber geladen.
+  // ------------------------------------------------------------
+  let miniActive = false;
+  let browseFrame = null;
+  let miniOverlay = null;
+  let lastBrowseUrl = '/';
+  try { lastBrowseUrl = sessionStorage.getItem('ytm-last-browse') || '/'; } catch (e) { /* ignorieren */ }
+
+  // Merken, wo du vor dem Video warst
+  let lastPath = location.pathname + location.search;
+  setInterval(function () {
+    const cur = location.pathname + location.search;
+    if (cur === lastPath) return;
+    if (!/^\/(watch|shorts)/.test(location.pathname)) {
+      lastBrowseUrl = cur;
+      try { sessionStorage.setItem('ytm-last-browse', cur); } catch (e) { /* ignorieren */ }
+    }
+    lastPath = cur;
+    // Videoseite verlassen → Vollbild/Mini aufräumen
+    if (!isWatchPage()) { exitLandscapeFs(); if (miniActive) closeMini(false); }
+  }, 500);
+
+  function buildMiniOverlay() {
+    if (miniOverlay) return miniOverlay;
+    const o = document.createElement('div');
+    o.id = 'ytm-mini-overlay';
+    o.style.cssText = [
+      'position:fixed', 'z-index:2147483643', 'display:none',
+      '-webkit-user-select:none', 'user-select:none', '-webkit-touch-callout:none',
+    ].join(';');
+    const close = document.createElement('div');
+    close.textContent = '✕';
+    close.style.cssText = [
+      'position:absolute', 'top:4px', 'right:4px', 'width:32px', 'height:32px',
+      'border-radius:16px', 'background:rgba(0,0,0,0.65)', 'color:#fff',
+      'font:16px -apple-system,sans-serif', 'display:flex', 'align-items:center',
+      'justify-content:center',
+    ].join(';');
+    const pp = document.createElement('div');
+    pp.textContent = '⏯';
+    pp.style.cssText = close.style.cssText.replace('right:4px', 'left:4px');
+
+    let last = 0;
+    const guard = function (fn) {
+      return function (ev) {
+        ev.preventDefault(); ev.stopPropagation();
+        const now = Date.now(); if (now - last < 500) return; last = now;
+        fn();
+      };
+    };
+    const onClose = guard(function () { closeMini(true); });
+    const onPP = guard(function () {
+      const v = document.querySelector('video');
+      if (!v) return;
+      if (v.paused) { userPausedAt = 0; const p = v.play(); if (p && p.catch) p.catch(function () {}); }
+      else { userPausedAt = Date.now(); v.pause(); }
+    });
+    const onRestore = guard(function () { restoreFromMini(); });
+    close.addEventListener('touchend', onClose, true); close.addEventListener('click', onClose, true);
+    pp.addEventListener('touchend', onPP, true); pp.addEventListener('click', onPP, true);
+    o.addEventListener('touchend', onRestore, false); o.addEventListener('click', onRestore, false);
+    o.appendChild(pp);
+    o.appendChild(close);
+    miniOverlay = o;
+    return o;
+  }
+
+  function positionOverlay() {
+    if (!miniOverlay || !playerHost) return;
+    const r = playerHost.getBoundingClientRect();
+    miniOverlay.style.left = r.left + 'px';
+    miniOverlay.style.top = r.top + 'px';
+    miniOverlay.style.width = r.width + 'px';
+    miniOverlay.style.height = r.height + 'px';
+  }
+
+  function enterMini() {
+    if (miniActive || !isWatchPage() || !markHost()) return;
+    miniActive = true;
+    exitLandscapeFs();
+
+    // Stöber-Ebene mit der letzten YouTube-Seite
+    browseFrame = document.createElement('iframe');
+    browseFrame.name = 'ytm-browse';
+    browseFrame.src = lastBrowseUrl || '/';
+    browseFrame.style.cssText = [
+      'position:fixed', 'top:0', 'left:0', 'width:100vw', 'height:100vh', 'height:100dvh',
+      'border:0', 'z-index:2147483638', 'background:#fff',
+    ].join(';');
+    document.documentElement.appendChild(browseFrame);
+
+    playerHost.style.transform = '';
+    document.documentElement.classList.add('ytm-mini');
+    applyScale();
+    const o = buildMiniOverlay();
+    if (!o.isConnected) document.documentElement.appendChild(o);
+    o.style.display = 'block';
+    nudgeLayout();
+    setTimeout(positionOverlay, 60);
+    setTimeout(positionOverlay, 450);
+  }
+
+  function teardownMini() {
+    miniActive = false;
+    document.documentElement.classList.remove('ytm-mini');
+    applyScale();
+    if (miniOverlay) miniOverlay.style.display = 'none';
+    if (browseFrame) {
+      try {
+        const loc = browseFrame.contentWindow.location;
+        if (!/^\/(watch|shorts)/.test(loc.pathname)) {
+          lastBrowseUrl = loc.pathname + loc.search;
+          sessionStorage.setItem('ytm-last-browse', lastBrowseUrl);
+        }
+      } catch (e) { /* ignorieren */ }
+      browseFrame.remove();
+      browseFrame = null;
+    }
+    nudgeLayout();
+  }
+
+  function restoreFromMini() {
+    if (!miniActive) return;
+    teardownMini();
+    window.scrollTo(0, 0);
+  }
+
+  // ✕: Video stoppen und auf der gerade angesehenen Seite bleiben
+  function closeMini(stopVideo) {
+    if (!miniActive) return;
+    let target = null;
+    try {
+      const loc = browseFrame.contentWindow.location;
+      target = loc.pathname + loc.search;
+    } catch (e) { /* ignorieren */ }
+    if (stopVideo) {
+      const v = document.querySelector('video');
+      if (v) { userPausedAt = Date.now(); v.pause(); }
+    }
+    teardownMini();
+    if (stopVideo) location.href = target || lastBrowseUrl || '/';
+  }
+
+  // Video in der Stöber-Ebene gewählt → dieses Video groß öffnen
+  window.addEventListener('message', function (ev) {
+    if (ev.origin !== location.origin || !ev.data || ev.data.type !== 'ytm-open') return;
+    teardownMini();
+    location.href = ev.data.href;
+  });
+
+  // Sicherheitsnetz: falls die Ebene doch auf eine Videoseite wechselt
+  setInterval(function () {
+    if (!miniActive || !browseFrame) return;
+    try {
+      const w = browseFrame.contentWindow;
+      w.document.querySelectorAll('video').forEach(function (v) { v.muted = true; });
+      if (w.location.pathname === '/watch' || /^\/shorts\//.test(w.location.pathname)) {
+        const href = w.location.pathname + w.location.search;
+        teardownMini();
+        location.href = href;
+      }
+    } catch (e) { /* ignorieren */ }
+    positionOverlay();
+  }, 400);
+
+  // Wischgeste: Video im Hochformat nach unten ziehen
+  let dragStartY = 0, dragStartX = 0, dragging = false, dragDy = 0, dragCandidate = false;
+
+  document.addEventListener('touchstart', function (ev) {
+    dragCandidate = false;
+    if (!CONFIG.miniPlayer || miniActive || fsActive || IN_BROWSE_FRAME) return;
+    if (!isWatchPage() || !isPortrait() || ev.touches.length !== 1) return;
+    const host = markHost();
+    if (!host || !host.contains(ev.target)) return;
+    const t = ev.touches[0];
+    dragStartX = t.clientX; dragStartY = t.clientY;
+    dragging = false; dragDy = 0; dragCandidate = true;
+  }, { capture: true, passive: true });
+
+  document.addEventListener('touchmove', function (ev) {
+    if (!dragCandidate) return;
+    const t = ev.touches[0];
+    const dy = t.clientY - dragStartY;
+    const dx = t.clientX - dragStartX;
+    if (!dragging) {
+      if (dy > 14 && dy > Math.abs(dx) * 1.5) dragging = true;
+      else if (Math.abs(dx) > 14 || dy < -14) { dragCandidate = false; return; }
+      else return;
+    }
+    ev.preventDefault();
+    ev.stopPropagation();
+    dragDy = Math.max(0, dy);
+    const s = Math.max(0.5, 1 - dragDy / 800);
+    playerHost.style.transition = 'none';
+    playerHost.style.transformOrigin = '100% 0';
+    playerHost.style.transform = 'translateY(' + dragDy + 'px) scale(' + s + ')';
+  }, { capture: true, passive: false });
+
+  function endDrag(ev) {
+    if (!dragCandidate) return;
+    dragCandidate = false;
+    if (!dragging) return;
+    dragging = false;
+    if (ev && ev.cancelable) { ev.preventDefault(); ev.stopPropagation(); }
+    if (dragDy > 110) {
+      playerHost.style.transition = '';
+      enterMini();
+    } else {
+      playerHost.style.transition = 'transform .2s';
+      playerHost.style.transform = '';
+      setTimeout(function () { if (playerHost) playerHost.style.transition = ''; }, 250);
+    }
+  }
+  document.addEventListener('touchend', endDrag, { capture: true, passive: false });
+  document.addEventListener('touchcancel', endDrag, { capture: true, passive: false });
+
+  // ------------------------------------------------------------
+  // In der Stöber-Ebene: Videos nicht dort öffnen, sondern groß
+  // ------------------------------------------------------------
+  function setupBrowseFrame() {
+    document.addEventListener('click', function (ev) {
+      const a = ev.target && ev.target.closest && ev.target.closest('a[href]');
+      if (!a) return;
+      const href = a.getAttribute('href');
+      if (!/^(https?:\/\/[^/]*youtube\.com)?\/(watch\?|shorts\/)/.test(href)) return;
+      ev.preventDefault();
+      ev.stopImmediatePropagation();
+      try { window.parent.postMessage({ type: 'ytm-open', href: href }, location.origin); } catch (e) { /* ignorieren */ }
+    }, true);
+  }
+
+  // ------------------------------------------------------------
   // Kleine Hinweis-Einblendung
   // ------------------------------------------------------------
   let toastEl = null;
@@ -606,12 +1127,16 @@
   }
 
   function start() {
+    if (IN_BROWSE_FRAME) { setupBrowseFrame(); return; }
+    injectPlayerCss();
+    window.addEventListener('resize', onOrientation);
+    window.addEventListener('orientationchange', function () { setTimeout(onOrientation, 250); });
     applyScale();
     setTimeout(verifyScale, 600);
     buildScaleButton();
     // YouTube setzt den Viewport teils neu – regelmäßig nachziehen
     setInterval(function () { applyScale(); buildScaleButton(); }, 1000);
-    toast('✓ YouTube-Skript aktiv – Größe mit ⤢ anpassen', 3000);
+    toast('✓ YouTube-Skript aktiv', 2500);
   }
 
   if (document.readyState === 'loading') {
