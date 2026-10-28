@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube Mobile - Werbefrei und Hintergrund-Wiedergabe
 // @namespace    yt-mobile-ipad
-// @version      1.2.0
+// @version      1.2.1
 // @description  Entfernt Werbung auf m.youtube.com, SponsorBlock und Wiedergabe bei gesperrtem Bildschirm oder im Hintergrund.
 // @match        *://m.youtube.com/*
 // @match        *://www.youtube.com/*
@@ -224,6 +224,10 @@
   //      ohne dein Zutun im Hintergrund angehalten wurde.
   // ------------------------------------------------------------
   let reallyHidden = function () { return false; };
+  // Zeitpunkt der letzten Pause/Bedienung durch dich (auch Sperrbildschirm)
+  let userPausedAt = 0;
+  // Zeitpunkt, an dem die Seite wirklich unsichtbar wurde (Display aus)
+  let hiddenAt = 0;
 
   if (CONFIG.backgroundPlay) {
     const proto = Document.prototype;
@@ -250,17 +254,25 @@
       proto.hasFocus = function () { return true; };
     } catch (e) { /* ignorieren */ }
 
-    // Sichtbarkeits-Meldungen abfangen, bevor YouTube sie sieht
+    // Sichtbarkeits-Meldungen abfangen, bevor YouTube sie sieht –
+    // uns selbst merken wir aber, WANN das Display ausging
     ['visibilitychange', 'webkitvisibilitychange'].forEach(function (type) {
-      window.addEventListener(type, function (ev) { ev.stopImmediatePropagation(); }, true);
-      document.addEventListener(type, function (ev) { ev.stopImmediatePropagation(); }, true);
+      const note = function (ev) {
+        if (reallyHidden()) hiddenAt = Date.now();
+        ev.stopImmediatePropagation();
+      };
+      window.addEventListener(type, note, true);
+      document.addEventListener(type, note, true);
     });
+    window.addEventListener('pagehide', function () { hiddenAt = Date.now(); }, true);
     window.addEventListener('blur', function (ev) {
       if (ev.target === window) ev.stopImmediatePropagation();
     }, true);
 
-    // Unterscheiden: Hast DU pausiert, oder das System im Hintergrund?
-    let userPausedAt = 0;
+    // Unterscheiden: Hast DU pausiert, oder das System beim Sperren?
+    // Das System pausiert direkt beim Ausschalten des Displays. Eine
+    // Pause, die später kommt, hast du gedrückt (z. B. Sperrbildschirm).
+    const AUTO_PAUSE_WINDOW = 2500;
     ['touchstart', 'click', 'keydown'].forEach(function (type) {
       document.addEventListener(type, function () { userPausedAt = Date.now(); }, true);
     });
@@ -273,15 +285,19 @@
     document.addEventListener('pause', function (ev) {
       const video = ev.target;
       if (!video || video.tagName !== 'VIDEO') return;
-      const byUser = Date.now() - userPausedAt < 1500;
+      const now = Date.now();
+      const byUser = now - userPausedAt < 1500;
       const ended = video.ended;
-      if (byUser || ended) { wasPlaying = false; return; }
-      // Pause kam nicht von dir → im Hintergrund mehrmals neu versuchen
-      if (wasPlaying && reallyHidden()) {
-        [50, 300, 800, 1500, 3000].forEach(function (delay) {
+      const hidden = reallyHidden();
+      const systemPause = hidden && hiddenAt && (now - hiddenAt < AUTO_PAUSE_WINDOW);
+      if (byUser || ended || !systemPause) { wasPlaying = false; return; }
+      // Pause kam vom System beim Sperren → ein paar Mal neu versuchen
+      if (wasPlaying) {
+        const pausedAt = now;
+        [50, 300, 800, 1500].forEach(function (delay) {
           setTimeout(function () {
             if (!video.paused || video.ended) return;
-            if (Date.now() - userPausedAt < 1500) return;
+            if (userPausedAt > pausedAt) return; // inzwischen selbst pausiert
             const p = video.play();
             if (p && p.catch) p.catch(function () {});
           }, delay);
@@ -381,10 +397,14 @@
 
     const handlers = {
       play: function () {
+        userPausedAt = 0;
         const v = getVideo();
         if (v) { const p = v.play(); if (p && p.catch) p.catch(function () {}); }
       },
-      pause: function () { const v = getVideo(); if (v) v.pause(); },
+      pause: function () {
+        userPausedAt = Date.now(); // Pause vom Sperrbildschirm = deine Pause
+        const v = getVideo(); if (v) v.pause();
+      },
       previoustrack: function () { goPrevious(); },
       nexttrack: function () { goNext(); },
       seekto: function (d) {
