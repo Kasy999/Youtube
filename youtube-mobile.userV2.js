@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube Mobile - Werbefrei und Hintergrund-Wiedergabe
 // @namespace    yt-mobile-ipad
-// @version      1.3.1
+// @version      1.4.0
 // @description  Entfernt Werbung auf m.youtube.com, SponsorBlock und Wiedergabe bei gesperrtem Bildschirm oder im Hintergrund.
 // @match        *://m.youtube.com/*
 // @match        *://www.youtube.com/*
@@ -43,6 +43,7 @@
     scaleButton: true,             // Knopf ⤢ zum Anpassen der Größe
     scaleSteps: [1, 0.9, 0.8, 0.7, 0.6, 0.5], // Größenstufen (1 = Original)
     rotateFullscreen: true,        // Querformat drehen = Vollbild
+    tapRealFullscreen: true,       // im Vollbild antippen = echtes Vollbild ohne Adressleiste
     miniPlayer: true,              // Video nach unten ziehen = Mini-Player
   };
 
@@ -711,6 +712,7 @@
     applyScale();
     showFsExit();
     nudgeLayout();
+    if (CONFIG.tapRealFullscreen) toast('Antippen für Vollbild ohne Adressleiste', 2500);
   }
 
   function exitLandscapeFs() {
@@ -718,6 +720,11 @@
     fsActive = false;
     document.documentElement.classList.remove('ytm-fs');
     if (fsExitBtn) fsExitBtn.style.display = 'none';
+    const fsEl = document.fullscreenElement || document.webkitFullscreenElement;
+    if (fsEl && fsEl === playerHost) {
+      const ex = document.exitFullscreen || document.webkitExitFullscreen;
+      try { const pr = ex.call(document); if (pr && pr.catch) pr.catch(function () {}); } catch (e) { /* ignorieren */ }
+    }
     applyScale();
     nudgeLayout();
   }
@@ -763,16 +770,62 @@
     }
   }
 
+  // Echtes Vollbild (blendet die Adressleiste aus). Geht nur direkt
+  // nach einem Antippen – deshalb beim ersten Tippen im Dreh-Vollbild.
+  // 1. Versuch: ganzer Player im Vollbild (Seiten-Vollbild)
+  // 2. Versuch: nativer iPad/iPhone-Videoplayer
+  let preferVideoFs = false;
+  function requestRealFullscreen() {
+    const v = document.querySelector('video');
+    const el = playerHost;
+    const elFn = el && (el.requestFullscreen || el.webkitRequestFullscreen);
+    const allowed = document.fullscreenEnabled || document.webkitFullscreenEnabled;
+    if (!preferVideoFs && elFn && allowed) {
+      try {
+        const pr = elFn.call(el);
+        if (pr && pr.catch) pr.catch(function () { preferVideoFs = true; });
+      } catch (e) { preferVideoFs = true; }
+      // Hat es nicht geklappt, nimmt der nächste Tipp den Videoplayer
+      setTimeout(function () {
+        if (!nativeFullscreen()) {
+          preferVideoFs = true;
+          toast('Nochmal tippen', 1500);
+        }
+      }, 700);
+      return;
+    }
+    if (v && typeof v.webkitEnterFullscreen === 'function') {
+      try { v.webkitEnterFullscreen(); } catch (e) { /* ignorieren */ }
+    }
+  }
+
+  document.addEventListener('touchend', function (ev) {
+    if (!fsActive || !CONFIG.tapRealFullscreen || nativeFullscreen()) return;
+    if (fsExitBtn && fsExitBtn.contains(ev.target)) return;
+    if (!playerHost || !playerHost.contains(ev.target)) return;
+    requestRealFullscreen();
+  }, true);
+
   // YouTubes eigener Vollbild-Knopf: unseres abschalten, Größe richtig setzen
   ['fullscreenchange', 'webkitfullscreenchange'].forEach(function (type) {
     document.addEventListener(type, function () {
-      if (nativeFullscreen()) exitLandscapeFs();
+      const fsEl = document.fullscreenElement || document.webkitFullscreenElement;
+      // Unser eigener Player im Vollbild → Dreh-Vollbild beibehalten
+      if (fsEl && playerHost && fsEl === playerHost) { applyScale(); return; }
+      // Vollbild beendet und Gerät steht hochkant → alles zurücksetzen
+      if (!fsEl && isPortrait()) exitLandscapeFs();
+      if (fsEl) exitLandscapeFs();
       applyScale();
       setTimeout(function () { wasPortrait = isPortrait(); }, 400);
     }, true);
   });
   ['webkitbeginfullscreen', 'webkitendfullscreen'].forEach(function (type) {
     document.addEventListener(type, function () {
+      if (type === 'webkitendfullscreen' && !isPortrait()) {
+        // zurück aus dem Videoplayer, Gerät noch quer → Dreh-Vollbild behalten
+        applyScale();
+        return;
+      }
       exitLandscapeFs();
       applyScale();
       setTimeout(function () { wasPortrait = isPortrait(); }, 400);
