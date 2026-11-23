@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         YouTube TV iPad - Werbefrei und Vollbild
 // @namespace    yt-tv-ipad
-// @version      1.7.1
-// @description  Entfernt Werbung in der YouTube-TV-Oberflaeche, SponsorBlock, Touch-Steuerung und Vollbild fuer das iPad.
+// @version      1.8.1
+// @description  Entfernt Werbung in der YouTube-TV-Oberflaeche, SponsorBlock, Touch-Steuerung, Vollbild und volle Videoqualitaet fuer das iPad.
 // @match        *://*.youtube.com/*
 // @match        *://youtube.com/*
 // @run-at       document-start
@@ -33,6 +33,13 @@
       // 'preview',     // Vorschau/Rückblick
       // 'music_offtopic', // Nicht-Musik-Teile in Musikvideos
     ],
+    quality: 'max',                // Videoqualität:
+                                   // 'max'    = höchste verfügbare Stufe
+                                   // 'hd2160' = höchstens 4K, 'hd1440' = 1440p,
+                                   // 'hd1080' = 1080p, 'hd720' = 720p
+                                   // false    = YouTube entscheiden lassen
+    spoofScreen: true,             // dem Player einen 4K-Bildschirm melden,
+                                   // damit er hohe Stufen überhaupt anbietet
     fullscreen: true,              // Seite beim Tippen ins Vollbild schalten
     touchNav: true,                // Wischen = Pfeiltasten wie auf der Fernbedienung
     swipeStepPx: 110,              // so viele Pixel Wischen = ein Schritt
@@ -55,6 +62,8 @@
   // YouTube schickt Werbung als Teil der JSON-Antworten mit.
   // Wir entfernen diese Teile, bevor die Seite sie verarbeitet
   // (gleiches Prinzip wie bei TizenTube).
+  // Hier wird außerdem die Bitraten-Grenze für den Player entfernt
+  // (siehe 1b).
   // ------------------------------------------------------------
   const AD_KEYS = ['adPlacements', 'adSlots', 'playerAds', 'adBreakHeartbeatParams'];
   const AD_RENDERERS = [
@@ -76,12 +85,18 @@
     if (!obj || typeof obj !== 'object' || depth > 40) return obj;
     if (Array.isArray(obj)) {
       for (let i = obj.length - 1; i >= 0; i--) {
-        if (isAdItem(obj[i])) obj.splice(i, 1);
+        if (CONFIG.adblock && isAdItem(obj[i])) obj.splice(i, 1);
         else clean(obj[i], depth + 1);
       }
       return obj;
     }
-    for (const k of AD_KEYS) if (k in obj) delete obj[k];
+    if (CONFIG.adblock) {
+      for (const k of AD_KEYS) if (k in obj) delete obj[k];
+    }
+    // Obergrenze für die Bitrate entfernen → höhere Stufen erlaubt
+    if (CONFIG.quality && obj.streamSelectionConfig && typeof obj.streamSelectionConfig === 'object') {
+      delete obj.streamSelectionConfig.maxBitrate;
+    }
     for (const k in obj) {
       const v = obj[k];
       if (v && typeof v === 'object') clean(v, depth + 1);
@@ -91,10 +106,11 @@
 
   function looksLikeYouTube(r) {
     return r && typeof r === 'object' && !Array.isArray(r) &&
-      ('responseContext' in r || 'playerResponse' in r || 'adPlacements' in r || 'playerAds' in r);
+      ('responseContext' in r || 'playerResponse' in r || 'adPlacements' in r ||
+       'playerAds' in r || 'playerConfig' in r || 'streamingData' in r);
   }
 
-  if (CONFIG.adblock) {
+  if (CONFIG.adblock || CONFIG.quality) {
     const origParse = JSON.parse;
     JSON.parse = function () {
       const r = origParse.apply(this, arguments);
@@ -112,6 +128,112 @@
   }
 
   // ------------------------------------------------------------
+  // 1b) VOLLE VIDEOQUALITÄT FREISCHALTEN
+  // Der TV-Player begrenzt auf dem iPad auf 720p, weil er
+  //   - die Bildschirmgröße abfragt (iPad ist „zu klein"),
+  //   - beim Browser nachfragt, ob 1080p+ abspielbar ist (mit
+  //     Zusatzangaben wie width=1920, die Safari nicht versteht),
+  //   - und Safari bei manchen Stufen „nicht flüssig" meldet.
+  // Wir beantworten diese Fragen passend und stellen danach die
+  // gewünschte Stufe direkt am Player ein.
+  // ------------------------------------------------------------
+  const QUALITY_ORDER = ['highres', 'hd2880', 'hd2160', 'hd1440', 'hd1080', 'hd720', 'large', 'medium', 'small', 'tiny'];
+  const QUALITY_NAMES = {
+    highres: '8K', hd2880: '5K', hd2160: '4K', hd1440: '1440p', hd1080: '1080p',
+    hd720: '720p', large: '480p', medium: '360p', small: '240p', tiny: '144p',
+  };
+
+  if (CONFIG.quality) {
+    // a) Großen Bildschirm melden
+    if (CONFIG.spoofScreen) {
+      const W = 3840, H = 2160;
+      const fake = { width: W, height: H, availWidth: W, availHeight: H };
+      Object.keys(fake).forEach(function (k) {
+        try {
+          Object.defineProperty(Screen.prototype, k, {
+            get: function () { return fake[k]; }, configurable: true,
+          });
+        } catch (e) { /* ignorieren */ }
+      });
+    }
+
+    // b) Formatabfragen ohne Auflösungs-/Bitrate-Angaben an Safari weiterreichen.
+    //    Der Codec selbst wird weiterhin echt geprüft – wir behaupten also
+    //    nichts, was das iPad nicht abspielen kann (HDR-Angabe „eotf" bleibt).
+    const STRIP = /^\s*(width|height|framerate|bitrate|decode-to-texture|cryptoblockformat)\s*=/i;
+    function stripParams(type) {
+      return String(type).split(';').filter(function (p) { return !STRIP.test(p); }).join(';');
+    }
+    [window.MediaSource, window.ManagedMediaSource, window.WebKitMediaSource].forEach(function (MS) {
+      if (!MS || typeof MS.isTypeSupported !== 'function' || MS.isTypeSupported._yttv) return;
+      const orig = MS.isTypeSupported.bind(MS);
+      const patched = function (type) {
+        try { return orig(stripParams(type)); } catch (e) { return false; }
+      };
+      patched._yttv = true;
+      try { MS.isTypeSupported = patched; } catch (e) { /* ignorieren */ }
+    });
+
+    // c) „Unterstützt, aber nicht flüssig" → als flüssig melden
+    const mc = navigator.mediaCapabilities;
+    if (mc && typeof mc.decodingInfo === 'function') {
+      const origDI = mc.decodingInfo.bind(mc);
+      try {
+        mc.decodingInfo = function (cfg) {
+          return origDI(cfg).then(function (res) {
+            if (!res || !res.supported) return res;
+            return { supported: true, smooth: true, powerEfficient: true, configuration: res.configuration };
+          });
+        };
+      } catch (e) { /* ignorieren */ }
+    }
+  }
+
+  // d) Gewünschte Stufe am Player einstellen
+  let qualityToastFor = null;
+
+  function getPlayer() {
+    const list = document.querySelectorAll('#movie_player, .html5-video-player');
+    for (let i = 0; i < list.length; i++) {
+      if (typeof list[i].getAvailableQualityLevels === 'function') return list[i];
+    }
+    return null;
+  }
+
+  function pickQuality(levels) {
+    const known = levels.filter(function (l) { return QUALITY_ORDER.indexOf(l) !== -1; });
+    if (!known.length) return null;
+    known.sort(function (a, b) { return QUALITY_ORDER.indexOf(a) - QUALITY_ORDER.indexOf(b); });
+    if (CONFIG.quality === 'max') return known[0];
+    const limit = QUALITY_ORDER.indexOf(CONFIG.quality);
+    if (limit === -1) return known[0];
+    for (const l of known) if (QUALITY_ORDER.indexOf(l) >= limit) return l;
+    return known[known.length - 1];
+  }
+
+  function enforceQuality() {
+    const id = getVideoId();
+    if (!id) { qualityToastFor = null; return; }
+    const p = getPlayer();
+    if (!p) return;
+    let levels;
+    try { levels = p.getAvailableQualityLevels(); } catch (e) { return; }
+    if (!levels || !levels.length) return;
+    const q = pickQuality(levels);
+    if (!q) return;
+    let now = null;
+    try { now = p.getPlaybackQuality(); } catch (e) { /* ignorieren */ }
+    if (now !== q) {
+      try { if (typeof p.setPlaybackQualityRange === 'function') p.setPlaybackQualityRange(q, q); } catch (e) { /* ignorieren */ }
+      try { if (typeof p.setPlaybackQuality === 'function') p.setPlaybackQuality(q); } catch (e) { /* ignorieren */ }
+    }
+    if (qualityToastFor !== id) {
+      qualityToastFor = id;
+      toast('Qualität: ' + (QUALITY_NAMES[q] || q));
+    }
+  }
+
+  // ------------------------------------------------------------
   // 2) SPONSORBLOCK
   // Holt von sponsor.ajay.app die von der Community markierten
   // Abschnitte und springt automatisch darüber.
@@ -124,16 +246,38 @@
     return m ? m[1] : null;
   }
 
+  // Datenschutz: Statt der Video-ID schicken wir nur die ersten
+  // 4 Zeichen ihres SHA-256-Hashes. Der Server liefert dann die
+  // Abschnitte vieler Videos, und wir suchen unseres selbst heraus.
+  async function sha256Prefix(text) {
+    const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+    const hex = Array.from(new Uint8Array(buf)).map(function (b) {
+      return b.toString(16).padStart(2, '0');
+    }).join('');
+    return hex.slice(0, 4);
+  }
+
   async function loadSegments(id) {
     segments = [];
     try {
-      const url = 'https://sponsor.ajay.app/api/skipSegments?videoID=' + id +
-        '&categories=' + encodeURIComponent(JSON.stringify(CONFIG.sponsorCategories));
-      const res = await fetch(url);
-      if (!res.ok) return; // 404 = keine Abschnitte für dieses Video
-      const data = await res.json();
-      if (id === currentId && Array.isArray(data)) {
-        segments = data.map(function (s) { return s.segment; });
+      const cats = '&categories=' + encodeURIComponent(JSON.stringify(CONFIG.sponsorCategories));
+      let list = null;
+      if (window.crypto && crypto.subtle) {
+        const res = await fetch('https://sponsor.ajay.app/api/skipSegments/' + (await sha256Prefix(id)) + '?' + cats.slice(1));
+        if (!res.ok) return; // 404 = keine Abschnitte
+        const data = await res.json();
+        const hit = Array.isArray(data) && data.find(function (v) { return v.videoID === id; });
+        list = hit ? hit.segments : null;
+      } else {
+        // Ausweichweg, falls crypto.subtle fehlt
+        const res = await fetch('https://sponsor.ajay.app/api/skipSegments?videoID=' + id + cats);
+        if (!res.ok) return;
+        list = await res.json();
+      }
+      if (id === currentId && Array.isArray(list)) {
+        segments = list
+          .filter(function (s) { return !s.actionType || s.actionType === 'skip'; })
+          .map(function (s) { return s.segment; });
       }
     } catch (e) { /* offline o. Ä. – einfach ignorieren */ }
   }
@@ -169,7 +313,22 @@
   //    Browser es zulässt. Geht es nicht, schickt der Knopf ⛶
   //    das laufende Video in den nativen iPad-Player.
   // ------------------------------------------------------------
+  const VIEWPORT = 'width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover';
+
+  // Viewport so setzen, dass auch die Randbereiche genutzt werden.
+  // Wird jede Sekunde geprüft, falls die Seite ihn überschreibt.
+  function applyViewport() {
+    let vp = document.querySelector('meta[name="viewport"]');
+    if (!vp) {
+      vp = document.createElement('meta');
+      vp.name = 'viewport';
+      (document.head || document.documentElement).appendChild(vp);
+    }
+    if (vp.content !== VIEWPORT) vp.content = VIEWPORT;
+  }
+
   function applyFillStyles() {
+    applyViewport();
     if (document.getElementById('yttv-fill-style')) return;
     const css = [
       'html, body {',
@@ -187,18 +346,23 @@
     style.id = 'yttv-fill-style';
     style.textContent = css;
     (document.head || document.documentElement).appendChild(style);
-
-    // Viewport so setzen, dass auch die Randbereiche genutzt werden
-    let vp = document.querySelector('meta[name="viewport"]');
-    if (!vp) {
-      vp = document.createElement('meta');
-      vp.name = 'viewport';
-      (document.head || document.documentElement).appendChild(vp);
-    }
-    vp.content = 'width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover';
   }
 
   let wantFs = CONFIG.fullscreen;
+  let exitingByButton = false;
+
+  // Verlässt du das Vollbild per iPad-Geste oder ✕, soll es nicht
+  // beim nächsten Antippen sofort wiederkommen. Über ⛶ wieder an.
+  function onFsChange() {
+    if (isFs()) return;
+    if (!exitingByButton && wantFs) {
+      wantFs = false;
+      toast('Vollbild aus – lange drücken und ⛶ tippen zum Einschalten');
+    }
+    exitingByButton = false;
+  }
+  document.addEventListener('fullscreenchange', onFsChange);
+  document.addEventListener('webkitfullscreenchange', onFsChange);
 
   function pageFsSupported() {
     const el = document.documentElement;
@@ -316,6 +480,9 @@
   function applyFill() {
     const vw = window.innerWidth, vh = window.innerHeight;
     if (!vw || !vh) return;
+    // Hat die Seite <body> ersetzt, ist unsere Skalierung weg –
+    // dann darf rawRect() nicht mehr mit den alten Werten zurückrechnen.
+    if (document.body && !document.body.style.transform) cur = { tx: 0, ty: 0, sx: 1, sy: 1 };
     // Hochformat (v. a. iPhone): Füllen würde fast alles abschneiden
     if (fillMode === 'contain' || vh > vw) { setTransform({ tx: 0, ty: 0, sx: 1, sy: 1 }); return; }
 
@@ -452,7 +619,7 @@
   }
 
   function onFsButton() {
-    if (isFs()) { wantFs = false; exitFs(); toast('Vollbild aus'); }
+    if (isFs()) { wantFs = false; exitingByButton = true; exitFs(); toast('Vollbild aus'); }
     else { wantFs = true; enterFs(true); }
   }
 
@@ -798,6 +965,8 @@
     // Anpassung an die Bildschirmgröße regelmäßig prüfen (Seite lädt nach)
     applyFill();
     setInterval(applyFill, 1500);
+    // Gewünschte Videoqualität regelmäßig durchsetzen
+    if (CONFIG.quality) setInterval(enforceQuality, 2000);
   }
 
   if (document.readyState === 'loading') {
